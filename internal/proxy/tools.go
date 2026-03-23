@@ -403,7 +403,7 @@ func isSuggestionMode(content string) bool {
 // injectToolsIntoMessages converts OpenAI-style messages+tools using "format as JSON" framing.
 // This approach bypasses Notion's system prompt by reframing tool calls as formatting/template tasks
 // rather than claiming the model has external tool access (which triggers refusal).
-func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string, toolChoice ...interface{}) []ChatMessage {
+func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string, session *Session, toolChoice ...interface{}) []ChatMessage {
 	if len(tools) == 0 {
 		return messages
 	}
@@ -560,15 +560,25 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 		log.Printf("[bridge] large tool set: %d→%d core tools, compact %d chars",
 			len(tools), len(coreTools), len(compactList))
 
-		// ── Chain collapse: flatten multi-turn to single message ──
-		// Notion AI's 27k system prompt causes refusal on follow-up turns when
-		// conversation history reveals the "unit test" framing. By collapsing
-		// everything into a single user message (same shape as turn 1), the model
-		// treats it as a fresh request and cooperates.
-		// Only collapse when the LAST message is a tool result (actual chain continuation).
+		// ── Chain continuation: handle tool results from previous turn ──
+		// Only applies when the LAST message is a tool result (actual chain continuation).
 		// If the last message is a user message, it's a new query — use normal framing.
 		isChainContinuation := len(messages) > 0 && messages[len(messages)-1].Role == "tool"
 		if isChainContinuation {
+			// ── Session-based multi-turn (preferred) ──
+			// When we have a valid session, the Notion thread already holds full context
+			// from previous turns (the "unit test" framing, model's JSON response, etc.).
+			// We only need to send a concise follow-up with latest tool results.
+			// This is sent as a partial transcript via CallInference, preserving full context.
+			if session != nil && session.TurnCount > 0 {
+				return buildSessionChainFollowUp(messages, compactList, extractedCwd)
+			}
+
+			// ── Legacy collapse (no session): flatten multi-turn to single message ──
+			// Notion AI's 27k system prompt causes refusal on follow-up turns when
+			// conversation history reveals the "unit test" framing. By collapsing
+			// everything into a single user message (same shape as turn 1), the model
+			// treats it as a fresh request and cooperates.
 			// Build tool call ID → name map
 			tcMap := make(map[string]string)
 			for _, m := range messages {
@@ -899,6 +909,74 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 	}
 
 	return result
+}
+
+// buildSessionChainFollowUp builds a concise follow-up message for session-based
+// multi-turn chain continuation. Unlike the legacy collapse approach, this only
+// includes the latest tool results because the Notion thread already holds full
+// context from previous turns (the original "unit test" framing, the model's JSON
+// response, etc.). The follow-up is sent as a partial transcript via CallInference.
+func buildSessionChainFollowUp(messages []ChatMessage, compactList string, cwd string) []ChatMessage {
+	// Build tool call ID → name map
+	tcMap := make(map[string]string)
+	for _, m := range messages {
+		for _, tc := range m.ToolCalls {
+			tcMap[tc.ID] = tc.Function.Name
+		}
+	}
+	resolveName := func(m ChatMessage) string {
+		if m.Name != "" {
+			return m.Name
+		}
+		if m.ToolCallID != "" {
+			if n, ok := tcMap[m.ToolCallID]; ok {
+				return n
+			}
+		}
+		return "tool"
+	}
+
+	// Find the last assistant message (tool results after this are the latest batch)
+	lastAssistantIdx := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "assistant" {
+			lastAssistantIdx = i
+			break
+		}
+	}
+
+	// Collect latest tool results (after the last assistant message)
+	var results strings.Builder
+	resultCount := 0
+	for i, m := range messages {
+		if m.Role != "tool" || i <= lastAssistantIdx {
+			continue
+		}
+		name := resolveName(m)
+		content := m.Content
+		if len(content) > 4000 {
+			content = content[:4000] + "\n... (truncated)"
+		}
+		if results.Len() > 0 {
+			results.WriteString("\n")
+		}
+		results.WriteString(fmt.Sprintf("[%s]: %s", name, content))
+		resultCount++
+	}
+
+	cwdLine := ""
+	if cwd != "" {
+		cwdLine = fmt.Sprintf("Working directory: %s\n", cwd)
+	}
+
+	followUp := fmt.Sprintf(
+		"Results from executed function(s):\n%s\n\n%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nIf these results answer the question, use __done__. Otherwise output the next function call.",
+		results.String(), cwdLine, compactList)
+
+	log.Printf("[bridge] session chain: follow-up for partial transcript (%d chars, %d tool results)",
+		len(followUp), resultCount)
+
+	return []ChatMessage{{Role: "user", Content: followUp}}
 }
 
 // ──────────────────────────────────────────────────────────────────

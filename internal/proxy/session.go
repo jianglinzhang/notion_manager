@@ -31,6 +31,10 @@ type Session struct {
 
 	// Model resolved on first turn (added to config on subsequent turns)
 	ModelUsed string
+
+	// Total non-system messages in the Anthropic request at this turn.
+	// Used to distinguish chain continuation (count increased) from retry (count unchanged).
+	RawMessageCount int
 }
 
 // SessionManager manages the mapping from Anthropic API conversation fingerprints to Notion threads.
@@ -161,6 +165,19 @@ func countUserMessages(messages []ChatMessage) int {
 	count := 0
 	for _, m := range messages {
 		if m.Role == "user" {
+			count++
+		}
+	}
+	return count
+}
+
+// countNonSystemMessages counts all messages except system-role messages.
+// Used for session continuation detection: tool chains add assistant+tool messages
+// each turn, while user message count stays constant.
+func countNonSystemMessages(messages []ChatMessage) int {
+	count := 0
+	for _, m := range messages {
+		if m.Role != "system" {
 			count++
 		}
 	}

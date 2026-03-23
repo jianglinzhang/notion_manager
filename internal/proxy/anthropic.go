@@ -504,6 +504,46 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		// Convert Anthropic tools to OpenAI tools format for tool injection
 		hasTools := !isResearcher && len(req.Tools) > 0
 		enableWebSearch := effectiveWebSearch
+
+		// ── Multi-turn session management ──
+		// Compute fingerprint BEFORE tool injection so it's stable across turns.
+		// Tool injection may collapse/modify messages, breaking fingerprint stability.
+		var fingerprint string
+		var session *Session
+		isFirstTurn := true
+		isRepeatTurn := false
+		rawMsgCount := 0
+
+		if !isResearcher {
+			fingerprint = computeSessionFingerprint(messages)
+			session = globalSessionManager.Get(fingerprint)
+			rawMsgCount = countNonSystemMessages(messages)
+
+			if session != nil {
+				if rawMsgCount < session.RawMessageCount {
+					// Message count decreased (edit/rollback) — invalidate session
+					log.Printf("[session] message rollback detected (rawMsgs=%d < prev=%d), clearing session",
+						rawMsgCount, session.RawMessageCount)
+					globalSessionManager.Delete(fingerprint)
+					session = nil
+				} else if rawMsgCount == session.RawMessageCount {
+					// Same message count — not a new turn (e.g. retry or tool call loop)
+					isRepeatTurn = true
+					log.Printf("[session] repeat turn detected (rawMsgs=%d, turnCount=%d), reusing session",
+						rawMsgCount, session.TurnCount)
+				}
+			}
+
+			if session != nil {
+				isFirstTurn = false
+				log.Printf("[session] found existing session: thread=%s turns=%d rawMsgs=%d account=%s",
+					session.ThreadID, session.TurnCount, session.RawMessageCount, session.AccountEmail)
+			} else {
+				isFirstTurn = true
+				log.Printf("[session] no existing session, will create new thread (fingerprint=%s)", fingerprint[:8])
+			}
+		}
+
 		if hasTools {
 			var tools []Tool
 			for _, t := range req.Tools {
@@ -526,7 +566,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 				log.Printf("[bridge] WebSearch/WebFetch detected — enabling Notion native search, stripping history")
 				messages = stripWebSearchHistory(messages)
 			}
-			messages = injectToolsIntoMessages(messages, tools, model, req.ToolChoice)
+			messages = injectToolsIntoMessages(messages, tools, model, session, req.ToolChoice)
 			// Log messages after tool injection only when verbose debugging is enabled.
 			if DebugLoggingEnabled() {
 				log.Printf("[debug] === After tool injection (%d messages) ===", len(messages))
@@ -534,46 +574,6 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					preview := truncateForLog(m.Content, 300)
 					log.Printf("[debug]   [%d] role=%s toolcalls=%d content_len=%d: %s", i, m.Role, len(m.ToolCalls), len(m.Content), preview)
 				}
-			}
-		}
-
-		// ── Multi-turn session management ──
-		// Compute fingerprint to identify this conversation across requests.
-		// Skip session management for researcher mode (no multi-turn needed).
-		var fingerprint string
-		var session *Session
-		isFirstTurn := true
-		isRepeatTurn := false
-		userMsgCount := 0
-
-		if !isResearcher {
-			fingerprint = computeSessionFingerprint(messages)
-			session = globalSessionManager.Get(fingerprint)
-			userMsgCount = countUserMessages(messages)
-
-			if session != nil {
-				if userMsgCount < session.TurnCount {
-					// Message count decreased (edit/rollback) — invalidate session
-					log.Printf("[session] message rollback detected (userMsgs=%d < turnCount=%d), clearing session",
-						userMsgCount, session.TurnCount)
-					globalSessionManager.Delete(fingerprint)
-					session = nil
-				} else if userMsgCount == session.TurnCount {
-					// Same user messages — not a new turn (e.g. retry or tool call loop)
-					// Treat as repeat of same turn, don't increment
-					isRepeatTurn = true
-					log.Printf("[session] repeat turn detected (userMsgs=%d, turnCount=%d), reusing session",
-						userMsgCount, session.TurnCount)
-				}
-			}
-
-			if session != nil {
-				isFirstTurn = false
-				log.Printf("[session] found existing session: thread=%s turns=%d account=%s",
-					session.ThreadID, session.TurnCount, session.AccountEmail)
-			} else {
-				isFirstTurn = true
-				log.Printf("[session] no existing session, will create new thread (fingerprint=%s)", fingerprint[:8])
 			}
 		}
 
@@ -742,27 +742,25 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 
 			// ── Success: save/update session ──
 			if !isResearcher && currentSession != nil && reqErr == nil {
-				completedTurns := userMsgCount
-				if completedTurns <= 0 {
-					completedTurns = 1
-				}
 				if isFirstTurn {
-					currentSession.TurnCount = completedTurns
+					currentSession.TurnCount = 1
+					currentSession.RawMessageCount = rawMsgCount
 					currentSession.UpdatedConfigIDs = []string{generateUUIDv4()}
 					currentSession.ModelUsed = ResolveModel(model)
 					globalSessionManager.Set(fingerprint, currentSession)
-					log.Printf("[session] saved new session: thread=%s fingerprint=%s",
-						currentSession.ThreadID, fingerprint[:8])
+					log.Printf("[session] saved new session: thread=%s fingerprint=%s rawMsgs=%d",
+						currentSession.ThreadID, fingerprint[:8], rawMsgCount)
 				} else if isRepeatTurn {
 					currentSession.LastUsedAt = time.Now()
 					log.Printf("[session] kept session unchanged on repeat turn: thread=%s turns=%d",
 						currentSession.ThreadID, currentSession.TurnCount)
 				} else {
-					currentSession.TurnCount = completedTurns
+					currentSession.TurnCount++
+					currentSession.RawMessageCount = rawMsgCount
 					currentSession.UpdatedConfigIDs = append(currentSession.UpdatedConfigIDs, generateUUIDv4())
 					currentSession.LastUsedAt = time.Now()
-					log.Printf("[session] updated session: thread=%s turns=%d",
-						currentSession.ThreadID, currentSession.TurnCount)
+					log.Printf("[session] updated session: thread=%s turns=%d rawMsgs=%d",
+						currentSession.ThreadID, currentSession.TurnCount, rawMsgCount)
 				}
 			}
 
@@ -1852,13 +1850,17 @@ func logAnthropicRequest(req AnthropicRequest, model string) {
 		case string:
 			preview := truncateForLog(s, 200)
 			log.Printf("[debug] ║ system(%d chars): %s", len(s), preview)
-			os.WriteFile("claude_code_system_dump.txt", []byte(s), 0644)
-			log.Printf("[debug] ║ system dumped to claude_code_system_dump.txt")
+			if AppConfig.Server.DumpAPIInput {
+				os.WriteFile("claude_code_system_dump.txt", []byte(s), 0644)
+				log.Printf("[debug] ║ system dumped to claude_code_system_dump.txt")
+			}
 		case []interface{}:
 			log.Printf("[debug] ║ system: %d content blocks", len(s))
-			sysDump, _ := json.MarshalIndent(s, "", "  ")
-			os.WriteFile("claude_code_system_dump.json", sysDump, 0644)
-			log.Printf("[debug] ║ system dumped to claude_code_system_dump.json")
+			if AppConfig.Server.DumpAPIInput {
+				sysDump, _ := json.MarshalIndent(s, "", "  ")
+				os.WriteFile("claude_code_system_dump.json", sysDump, 0644)
+				log.Printf("[debug] ║ system dumped to claude_code_system_dump.json")
+			}
 		}
 	}
 
@@ -1868,10 +1870,11 @@ func logAnthropicRequest(req AnthropicRequest, model string) {
 		for _, t := range req.Tools {
 			log.Printf("[debug] ║   - %s: %s", t.Name, t.Description)
 		}
-		// Dump full tool schemas to file for analysis
-		toolDump, _ := json.MarshalIndent(req.Tools, "", "  ")
-		os.WriteFile("claude_code_tools_dump.json", toolDump, 0644)
-		log.Printf("[debug] ║ tools dumped to claude_code_tools_dump.json (%d bytes)", len(toolDump))
+		if AppConfig.Server.DumpAPIInput {
+			toolDump, _ := json.MarshalIndent(req.Tools, "", "  ")
+			os.WriteFile("claude_code_tools_dump.json", toolDump, 0644)
+			log.Printf("[debug] ║ tools dumped to claude_code_tools_dump.json (%d bytes)", len(toolDump))
+		}
 	}
 
 	// Log tool_choice

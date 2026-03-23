@@ -1,7 +1,7 @@
 <div align="center">
   <h1>notion-manager</h1>
   <p><strong>Local account pool, dashboard, and protocol proxy for Notion AI</strong></p>
-  <p>Run multiple Notion sessions behind one local entrypoint with pooled accounts, quota visibility, a browser dashboard, and an Anthropic-compatible API.</p>
+  <p>Run multiple Notion sessions behind one local entrypoint with pooled accounts, quota visibility, a browser dashboard, an Anthropic-compatible API, and Claude Code compatibility.</p>
 
   <p>
     <img src="https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square" alt="Go">
@@ -74,6 +74,34 @@
   <img src="img/cherry.jpg" alt="Cherry Studio" width="480"><br>
   <em>Works with <a href="https://github.com/CherryHQ/cherry-studio">Cherry Studio</a> — a multi-LLM desktop client</em>
 </p>
+
+### Claude Code Integration
+
+Compatible with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's official agentic coding tool. Multi-turn tool chaining, file operations, shell commands, and extended thinking work through Notion AI via a [three-layer compatibility bridge](docs/claude-code-integration.md).
+
+<p align="center">
+  <img src="img/claude-code-demo.jpg" alt="Claude Code Demo" width="480"><br>
+  <em>Claude Code analyzing project architecture through notion-manager — multi-turn tool chaining with session persistence</em>
+</p>
+
+<p align="center">
+  <img src="img/claude-code-demo_2.jpg" alt="Claude Code Thinking" width="480"><br>
+  <em>Extended thinking support — Claude Code's reasoning chain is fully streamed</em>
+</p>
+
+**Setup** — just two environment variables:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8081
+export ANTHROPIC_API_KEY=your-api-key
+claude  # start interactive session
+```
+
+**What works**: Shell commands, file read/write/edit, file search (Glob/Grep), web search, multi-turn tool chaining, extended thinking, streaming, model selection (Opus/Sonnet/Haiku).
+
+**How it works**: Notion AI's ~27k server-side system prompt creates a strong "I am Notion AI" identity that refuses external tool calls. The proxy bypasses this by (1) dropping conflicting system prompts, (2) stripping XML control tags, and (3) reframing requests as code generation ("unit test" framing). A `__done__` pseudo-function keeps the model permanently in JSON output mode — it never switches to "respond as assistant" mode, which would trigger Notion AI identity regression. See [Claude Code Integration Details](docs/claude-code-integration.md) for the full technical explanation and [Notion's system prompt](docs/notion_system_prompt.md).
+
+**Limitations**: Only 8 core tools (of 18+) are supported (larger tool lists break the framing), latency is higher per turn, and management tools (Agent, MCP, LSP) are filtered out.
 
 ### Research mode and search control
 
@@ -188,6 +216,8 @@ curl http://localhost:3000/v1/messages \
 - [API Usage](docs/api.md) — Standard requests, search overrides, file uploads, research mode
 - [Dashboard & Proxy](docs/dashboard.md) — Dashboard login, proxy session workflow
 - [Configuration](docs/configuration.md) — Full config reference, endpoints, notes
+- [Claude Code Integration](docs/claude-code-integration.md) — How Claude Code works through Notion AI, capabilities, and limitations
+- [Notion System Prompt](docs/notion_system_prompt.md) — Notion AI's full server-side system prompt (~27k tokens)
 
 ## License
 

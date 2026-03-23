@@ -37,6 +37,7 @@ type ServerConfig struct {
 	APILogOutput  bool   `yaml:"api_log_output"`
 	NotionLogReq  bool   `yaml:"notion_log_request"`
 	NotionLogResp bool   `yaml:"notion_log_response"`
+	DumpAPIInput  bool   `yaml:"dump_api_input"`
 }
 
 type ProxyConfig struct {
@@ -175,6 +176,9 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 	if v := os.Getenv("NOTION_LOG_RESPONSE"); v != "" {
 		cfg.Server.NotionLogResp = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv("DUMP_API_INPUT"); v != "" {
+		cfg.Server.DumpAPIInput = strings.EqualFold(v, "true") || v == "1"
 	}
 	if v := os.Getenv("NOTION_API_BASE"); v != "" {
 		cfg.Proxy.NotionAPIBase = v

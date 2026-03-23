@@ -1,7 +1,7 @@
 <div align="center">
   <h1>notion-manager</h1>
   <p><strong>Notion AI 多账号池、Dashboard 与本地协议代理</strong></p>
-  <p>将多个 Notion 账号集中管理，通过一个本地入口实现账号池化、额度监控、API 代理和 Web 代理。</p>
+  <p>将多个 Notion 账号集中管理，通过一个本地入口实现账号池化、额度监控、API 代理、Web 代理，并兼容 Claude Code。</p>
 
   <p>
     <img src="https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square" alt="Go">
@@ -75,14 +75,42 @@
   <em>兼容 <a href="https://github.com/CherryHQ/cherry-studio">Cherry Studio</a> — 多模型桌面客户端</em>
 </p>
 
-### 5. 研究模式与搜索控制
+### 5. Claude Code 集成
+
+兼容 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic 官方的 Agentic 编程工具。多轮工具链调用、文件操作、Shell 命令和扩展思维链均可通过 Notion AI 正常工作，背后依赖[三层兼容桥接](docs/claude-code-integration.md)实现。
+
+<p align="center">
+  <img src="img/claude-code-demo.jpg" alt="Claude Code Demo" width="480"><br>
+  <em>Claude Code 通过 notion-manager 分析项目架构 — 多轮工具链 + 会话持久化</em>
+</p>
+
+<p align="center">
+  <img src="img/claude-code-demo_2.jpg" alt="Claude Code Thinking" width="480"><br>
+  <em>扩展思维链支持 — Claude Code 的推理过程完整流式输出</em>
+</p>
+
+**配置** — 仅需两个环境变量：
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8081
+export ANTHROPIC_API_KEY=your-api-key
+claude  # 启动交互式会话
+```
+
+**支持的能力**：Shell 命令、文件读写编辑、文件搜索（Glob/Grep）、联网搜索、多轮工具链、扩展思维链、流式输出、模型选择（Opus/Sonnet/Haiku）。
+
+**工作原理**：Notion AI 服务端注入的 ~27k token 系统提示词赋予模型强烈的 "我是 Notion AI" 身份，会拒绝外部工具调用。代理通过三步绕过：(1) 丢弃冲突的系统提示词，(2) 剥离 XML 控制标签，(3) 将请求伪装为代码生成任务（"单元测试"framing）。`__done__` 伪函数使模型始终保持 JSON 输出模式 — 永远不切换到"正常回复"模式，避免触发 Notion AI 身份回归。详见 [Claude Code 集成技术细节](docs/claude-code-integration.md) 和 [Notion 系统提示词](docs/notion_system_prompt.md)。
+
+**已知限制**：仅支持 8 个核心工具（原 18+ 个，更大的工具列表会破坏 framing），每轮延迟较高，管理工具（Agent、MCP、LSP）被过滤。
+
+### 6. 研究模式与搜索控制
 
 - 使用 `researcher` 或 `fast-researcher` 作为模型名即可触发研究模式
 - 研究模式会流式输出 thinking 块和最终报告文本
 - 普通模型支持联网搜索与工作区搜索
 - 搜索开关优先级为：请求头覆盖 > Dashboard / `config.yaml` > 默认值
 
-### 6. Chrome 扩展提取账号
+### 7. Chrome 扩展提取账号
 
 - 扩展位于 `chrome-extension/`
 - 可从当前登录的 `notion.so` 会话中提取：
@@ -200,6 +228,8 @@ curl http://localhost:3000/v1/messages \
 - [API 接入](docs/api_cn.md) — 标准请求、搜索控制、文件上传、研究模式
 - [Dashboard 与代理](docs/dashboard_cn.md) — 登录认证、代理会话流程
 - [配置说明](docs/configuration_cn.md) — 完整配置参考、端点列表、项目结构、使用建议
+- [Claude Code 集成](docs/claude-code-integration.md) — Claude Code 如何通过 Notion AI 工作、能力与限制
+- [Notion 系统提示词](docs/notion_system_prompt.md) — Notion AI 服务端注入的完整系统提示词（~27k tokens）
 
 ## 许可证
 

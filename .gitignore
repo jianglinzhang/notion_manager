@@ -18,6 +18,8 @@ server.log
 server.stderr.log
 test_*.json
 api_probes/
+claude_code_system_dump.*
+claude_code_tools_dump.*
 
 # Frontend build artifacts
 web/dist/

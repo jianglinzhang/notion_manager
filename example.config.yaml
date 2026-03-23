@@ -26,6 +26,10 @@ server:
     notion_log_request: true
     # Log raw runInferenceTranscript responses received from Notion (env: NOTION_LOG_RESPONSE).
     notion_log_response: true
+    # Dump incoming API system prompts and tool schemas to files (env: DUMP_API_INPUT).
+    # When true, writes claude_code_system_dump.json/txt and claude_code_tools_dump.json
+    # to the working directory on each request. Useful for debugging Claude Code integration.
+    dump_api_input: false
     # Dashboard admin password. Set a plaintext password here;
     # on first startup it will be replaced with a SHA256+salt hash.
     # If empty, a random password will be generated and printed to console.
