@@ -1,38 +1,51 @@
-# Stage 1: Go 构建（官方要求 Go 1.25）
-FROM golang:1.25-alpine AS builder
+# --- Stage 1: 构建前端 (React) ---
+FROM node:22-alpine AS web-builder
+WORKDIR /app/web
+# 复制前端源码
+COPY web/package*.json ./
+RUN npm install
+COPY web/ .
+RUN npm run build
+
+# --- Stage 2: 构建后端 (Go) ---
+FROM golang:1.24-alpine AS builder
+
+# 安装 git（Go 编译某些包可能需要）
+RUN apk add --no-cache git
 
 WORKDIR /app
 
-# 复制全部源码
+# 1. 先下载 Go 依赖（利用 Docker 缓存）
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 2. 复制全部源码
 COPY . .
 
-# ==================== 构建 + 详细调试日志 ====================
-RUN go mod download && \
-    echo "=== 当前目录文件 ===" && ls -la && \
-    echo "=== 开始 go build ===" && \
-    CGO_ENABLED=0 GOOS=linux go build -o /app/notion-manager ./cmd/notion-manager && \
-    echo "=== 构建完成，检查二进制 ===" && \
-    ls -la /app/notion-manager || echo "❌ 二进制生成失败！" && \
-    echo "=== 二进制大小 ===" && \
-    ls -lh /app/notion-manager
+# 3. 从上一个阶段把前端构建好的 dist 复制进来
+# 注意：根据官方说明，需要放到 internal/web/ 目录下
+RUN mkdir -p internal/web && \
+    rm -rf internal/web/dist && \
+    cp -r web/dist internal/web/
 
-# Stage 2: 运行时镜像
+# 4. 编译 Go 二进制文件
+# 禁用 CGO 以实现完全静态链接，确保在 alpine 中运行
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /notion-manager ./cmd/notion-manager
+
+# --- Stage 3: 最终运行镜像 ---
 FROM alpine:latest
-
-RUN apk --no-cache add ca-certificates tzdata && \
-    adduser -D -u 1000 appuser
+RUN apk --no-cache add ca-certificates tzdata
 
 WORKDIR /app
 
-# 复制二进制 + 权限
-COPY --from=builder /app/notion-manager /app/notion-manager
+# 从构建阶段复制二进制文件
+COPY --from=builder /notion-manager /app/notion-manager
 
-RUN chmod +x /app/notion-manager && \
-    mkdir -p /app/accounts /app/data
+# 预创建数据目录
+RUN mkdir -p /app/accounts /app/data
 
-USER appuser
-
+# 暴露端口 (config 默认是 8081)
 EXPOSE 8081
 
-# 绝对路径启动
-CMD ["/app/notion-manager"]
+# 启动
+ENTRYPOINT ["/app/notion-manager"]
