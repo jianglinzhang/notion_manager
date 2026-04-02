@@ -1,7 +1,7 @@
-# ========= 1. 构建前端 =========
+# ========= 1) 构建前端 =========
 FROM node:20-bookworm AS web-builder
 
-WORKDIR /app/web
+WORKDIR /src/web
 
 COPY web/package*.json ./
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
@@ -10,24 +10,30 @@ COPY web/ ./
 RUN npm run build
 
 
-# ========= 2. 构建 Go 后端 =========
-FROM golang:1.24-bookworm AS go-builder
+# ========= 2) 构建 Go =========
+FROM golang:1.25-bookworm AS go-builder
 
-WORKDIR /app
+WORKDIR /src
 
-COPY go.mod go.sum ./
-RUN go mod download
-
+# 先复制整个项目，避免 go.mod 有本地 replace 时 go mod download 失败
 COPY . .
 
-# 按 README 的方式，把前端 dist 拷贝到 embed 目录
-COPY --from=web-builder /app/web/dist /app/internal/web/dist
+# 拷贝前端构建产物到 embed 目录
+COPY --from=web-builder /src/web/dist /src/internal/web/dist
 
-# 直接 go build，不要加 CGO_ENABLED=0
-RUN go build -v -o /app/notion-manager ./cmd/notion-manager
+# 可选：设置 Go 代理，提高稳定性
+RUN go env -w GOPROXY=https://proxy.golang.org,direct
+
+# 调试信息 + 构建
+RUN go version && \
+    cat go.mod && \
+    ls -la /src && \
+    ls -la /src/internal/web && \
+    go mod download && \
+    go build -v -o /src/notion-manager ./cmd/notion-manager
 
 
-# ========= 3. 运行镜像 =========
+# ========= 3) 运行镜像 =========
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -36,7 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY --from=go-builder /app/notion-manager /app/notion-manager
+COPY --from=go-builder /src/notion-manager /app/notion-manager
 
 RUN mkdir -p /app/accounts /app/data
 
