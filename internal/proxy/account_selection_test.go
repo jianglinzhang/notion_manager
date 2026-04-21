@@ -136,7 +136,8 @@ func TestGetBestAccountUsesEffectiveRemaining(t *testing.T) {
 	}
 }
 
-func TestNextPrefersHigherEffectiveRemaining(t *testing.T) {
+func TestNextRoundRobinsRegardlessOfQuota(t *testing.T) {
+	// Next() should rotate through accounts regardless of remaining quota.
 	pool := &AccountPool{
 		accounts: []*Account{
 			{
@@ -162,13 +163,17 @@ func TestNextPrefersHigherEffectiveRemaining(t *testing.T) {
 		},
 	}
 
-	got := pool.Next()
-	if got == nil || got.UserEmail != "high@example.com" {
-		t.Fatalf("expected highest-remaining account, got %#v", got)
+	first := pool.Next()
+	second := pool.Next()
+	if first == nil || second == nil {
+		t.Fatal("expected non-nil accounts")
+	}
+	if first.UserEmail == second.UserEmail {
+		t.Fatalf("expected different accounts on consecutive calls, both got %s", first.UserEmail)
 	}
 }
 
-func TestNextExcludingPrefersBestRemainingAmongUntried(t *testing.T) {
+func TestNextExcludingRoundRobinsSkippingExcluded(t *testing.T) {
 	low := &Account{
 		UserEmail: "low@example.com",
 		QuotaInfo: &QuotaInfo{
@@ -203,9 +208,21 @@ func TestNextExcludingPrefersBestRemainingAmongUntried(t *testing.T) {
 		accounts: []*Account{low, mid, high},
 	}
 
-	got := pool.NextExcluding(map[*Account]bool{high: true})
-	if got == nil || got.UserEmail != "mid@example.com" {
-		t.Fatalf("expected best remaining untried account, got %#v", got)
+	// With high excluded, NextExcluding should rotate between low and mid
+	exclude := map[*Account]bool{high: true}
+	seen := map[string]int{}
+	for i := 0; i < 4; i++ {
+		got := pool.NextExcluding(exclude)
+		if got == nil {
+			t.Fatal("expected non-nil account")
+		}
+		if got.UserEmail == "high@example.com" {
+			t.Fatal("excluded account should not be returned")
+		}
+		seen[got.UserEmail]++
+	}
+	if seen["low@example.com"] == 0 || seen["mid@example.com"] == 0 {
+		t.Fatalf("expected both low and mid to appear, got: %v", seen)
 	}
 }
 
@@ -226,6 +243,81 @@ func TestNextForResearchAllowsPremiumAtLimit(t *testing.T) {
 	got := pool.NextForResearch()
 	if got == nil || got.UserEmail != "premium@example.com" {
 		t.Fatalf("expected premium account to remain research-capable, got %#v", got)
+	}
+}
+
+// ── Round-Robin distribution tests ──
+
+func TestNextDistributesEvenly(t *testing.T) {
+	// Three accounts with identical quota — Next() must rotate across all three.
+	pool := &AccountPool{
+		accounts: []*Account{
+			{UserEmail: "a@example.com", QuotaInfo: &QuotaInfo{IsEligible: true, SpaceLimit: 200, SpaceUsage: 100, UserLimit: 200, UserUsage: 100}},
+			{UserEmail: "b@example.com", QuotaInfo: &QuotaInfo{IsEligible: true, SpaceLimit: 200, SpaceUsage: 100, UserLimit: 200, UserUsage: 100}},
+			{UserEmail: "c@example.com", QuotaInfo: &QuotaInfo{IsEligible: true, SpaceLimit: 200, SpaceUsage: 100, UserLimit: 200, UserUsage: 100}},
+		},
+	}
+	seen := map[string]int{}
+	for i := 0; i < 6; i++ {
+		acc := pool.Next()
+		if acc == nil {
+			t.Fatal("expected non-nil account")
+		}
+		seen[acc.UserEmail]++
+	}
+	for _, email := range []string{"a@example.com", "b@example.com", "c@example.com"} {
+		if seen[email] != 2 {
+			t.Fatalf("expected each account called 2 times in 6 calls, got distribution: %v", seen)
+		}
+	}
+}
+
+func TestNextDistributesWithUnequalQuota(t *testing.T) {
+	// Even with different remaining quotas, Next() should still round-robin.
+	pool := &AccountPool{
+		accounts: []*Account{
+			{UserEmail: "low@example.com", QuotaInfo: &QuotaInfo{IsEligible: true, SpaceLimit: 200, SpaceUsage: 160, UserLimit: 200, UserUsage: 160}},
+			{UserEmail: "high@example.com", QuotaInfo: &QuotaInfo{IsEligible: true, SpaceLimit: 200, SpaceUsage: 40, UserLimit: 200, UserUsage: 40}},
+		},
+	}
+	seen := map[string]int{}
+	for i := 0; i < 4; i++ {
+		acc := pool.Next()
+		if acc == nil {
+			t.Fatal("expected non-nil account")
+		}
+		seen[acc.UserEmail]++
+	}
+	for _, email := range []string{"low@example.com", "high@example.com"} {
+		if seen[email] != 2 {
+			t.Fatalf("expected each account called 2 times in 4 calls, got distribution: %v", seen)
+		}
+	}
+}
+
+func TestNextExcludingRoundRobinsAmongUntried(t *testing.T) {
+	a := &Account{UserEmail: "a@example.com", QuotaInfo: &QuotaInfo{IsEligible: true, SpaceLimit: 200, SpaceUsage: 20, UserLimit: 200, UserUsage: 20}}
+	b := &Account{UserEmail: "b@example.com", QuotaInfo: &QuotaInfo{IsEligible: true, SpaceLimit: 200, SpaceUsage: 80, UserLimit: 200, UserUsage: 80}}
+	c := &Account{UserEmail: "c@example.com", QuotaInfo: &QuotaInfo{IsEligible: true, SpaceLimit: 200, SpaceUsage: 170, UserLimit: 200, UserUsage: 170}}
+	pool := &AccountPool{
+		accounts: []*Account{a, b, c},
+	}
+
+	// Exclude 'a': both b and c must appear, 'a' must never appear
+	exclude := map[*Account]bool{a: true}
+	seen := map[string]int{}
+	for i := 0; i < 6; i++ {
+		acc := pool.NextExcluding(exclude)
+		if acc == nil {
+			t.Fatal("expected non-nil account")
+		}
+		if acc.UserEmail == "a@example.com" {
+			t.Fatal("excluded account should not be returned")
+		}
+		seen[acc.UserEmail]++
+	}
+	if seen["b@example.com"] == 0 || seen["c@example.com"] == 0 {
+		t.Fatalf("expected both b and c to appear, got: %v", seen)
 	}
 }
 

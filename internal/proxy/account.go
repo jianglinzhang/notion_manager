@@ -220,7 +220,7 @@ func (p *AccountPool) LoadSingle(tokenFile string) error {
 func (p *AccountPool) Next() *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.pickBestAccountLocked(nil)
+	return p.pickNextRoundRobin(nil)
 }
 
 // NextForResearch returns the next available account suitable for research mode.
@@ -270,12 +270,33 @@ func (p *AccountPool) NextForResearch() *Account {
 func (p *AccountPool) NextExcluding(exclude map[*Account]bool) *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.pickBestAccountLocked(exclude)
+	return p.pickNextRoundRobin(exclude)
+}
+
+// pickNextRoundRobin returns the first available (non-exhausted, non-excluded)
+// account starting from the rotating index. This gives true round-robin
+// distribution across accounts.
+func (p *AccountPool) pickNextRoundRobin(exclude map[*Account]bool) *Account {
+	n := len(p.accounts)
+	if n == 0 {
+		return nil
+	}
+	start := p.index.Add(1) - 1
+	for i := 0; i < n; i++ {
+		acc := p.accounts[(start+uint64(i))%uint64(n)]
+		if exclude != nil && exclude[acc] {
+			continue
+		}
+		if p.isQuotaExhausted(acc) {
+			continue
+		}
+		return acc
+	}
+	return nil
 }
 
 // pickBestAccountLocked returns the available account with the highest
-// effective remaining quota. Ties are broken by the rotating start index so
-// equally healthy accounts still share traffic.
+// effective remaining quota. Used by GetBestAccount (dashboard).
 func (p *AccountPool) pickBestAccountLocked(exclude map[*Account]bool) *Account {
 	n := len(p.accounts)
 	if n == 0 {
@@ -451,8 +472,15 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 	p.refreshTotal = len(accs)
 	p.refreshMu.Unlock()
 
-	log.Printf("[refresh] refreshing %d accounts (quota + models)...", len(accs))
-	modelsUpdated := false
+	concurrency := 10
+	if AppConfig != nil && AppConfig.Refresh.Concurrency > 0 {
+		concurrency = AppConfig.Refresh.Concurrency
+	}
+	log.Printf("[refresh] refreshing %d accounts (quota + models, concurrency=%d)...", len(accs), concurrency)
+
+	var modelsUpdatedFlag atomic.Bool
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
 
 	for _, acc := range accs {
 		quota := acc.quotaSnapshot()
@@ -460,65 +488,78 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 		if quota.PermanentlyExhausted {
 			if isFreePlan(acc) {
 				log.Printf("[refresh] %s (%s): ⛔ permanently exhausted (skipped)", acc.UserName, acc.UserEmail)
+				p.refreshMu.Lock()
+				p.refreshDone++
+				p.refreshMu.Unlock()
 				continue
 			}
 			log.Printf("[refresh] %s (%s): clearing stale permanent exhaustion flag before re-check", acc.UserName, acc.UserEmail)
 			p.ClearQuotaExhausted(acc)
 		}
 
-		// 1. Check quota
-		info, err := CheckQuota(acc)
-		if err != nil {
-			log.Printf("[refresh] %s (%s): quota check failed: %v", acc.UserName, acc.UserEmail, err)
-		} else {
-			now := time.Now()
-			acc.setQuotaInfo(info, &now)
+		wg.Add(1)
+		sem <- struct{}{} // acquire semaphore slot
+		go func(acc *Account, quota accountQuotaSnapshot) {
+			defer wg.Done()
+			defer func() { <-sem }() // release semaphore slot
 
-			if info.IsEligible {
-				remaining := basicRemaining(info)
-				premiumInfo := ""
-				if info.HasPremium {
-					premiumInfo = fmt.Sprintf(", premium %d/%d", info.PremiumUsage, info.PremiumLimit)
-				}
-				if info.ResearchModeUsage > 0 {
-					premiumInfo += fmt.Sprintf(", research=%d", info.ResearchModeUsage)
-				}
-				// If was exhausted, clear the flag — API confirmed recovery
-				if quota.ExhaustedAt != nil {
-					log.Printf("[refresh] %s (%s): ✅ RECOVERED! (space %d/%d, user %d/%d, remaining ~%d%s)",
-						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit, remaining, premiumInfo)
-					p.ClearQuotaExhausted(acc)
-				} else {
-					log.Printf("[refresh] %s (%s): ✅ eligible (space %d/%d, user %d/%d, remaining ~%d%s)",
-						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit, remaining, premiumInfo)
-				}
+			// 1. Check quota
+			info, err := CheckQuota(acc)
+			if err != nil {
+				log.Printf("[refresh] %s (%s): quota check failed: %v", acc.UserName, acc.UserEmail, err)
 			} else {
-				if isFreePlan(acc) {
-					log.Printf("[refresh] %s (%s): ❌ NOT eligible (space %d/%d, user %d/%d, marking permanent)",
-						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit)
-					p.MarkPermanentlyExhausted(acc)
+				now := time.Now()
+				acc.setQuotaInfo(info, &now)
+
+				if info.IsEligible {
+					remaining := basicRemaining(info)
+					premiumInfo := ""
+					if info.HasPremium {
+						premiumInfo = fmt.Sprintf(", premium %d/%d", info.PremiumUsage, info.PremiumLimit)
+					}
+					if info.ResearchModeUsage > 0 {
+						premiumInfo += fmt.Sprintf(", research=%d", info.ResearchModeUsage)
+					}
+					// If was exhausted, clear the flag — API confirmed recovery
+					if quota.ExhaustedAt != nil {
+						log.Printf("[refresh] %s (%s): ✅ RECOVERED! (space %d/%d, user %d/%d, remaining ~%d%s)",
+							acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit, remaining, premiumInfo)
+						p.ClearQuotaExhausted(acc)
+					} else {
+						log.Printf("[refresh] %s (%s): ✅ eligible (space %d/%d, user %d/%d, remaining ~%d%s)",
+							acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit, remaining, premiumInfo)
+					}
 				} else {
-					log.Printf("[refresh] %s (%s): ❌ NOT eligible (space %d/%d, user %d/%d)",
-						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit)
-					p.MarkQuotaExhausted(acc)
+					if isFreePlan(acc) {
+						log.Printf("[refresh] %s (%s): ❌ NOT eligible (space %d/%d, user %d/%d, marking permanent)",
+							acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit)
+						p.MarkPermanentlyExhausted(acc)
+					} else {
+						log.Printf("[refresh] %s (%s): ❌ NOT eligible (space %d/%d, user %d/%d)",
+							acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit)
+						p.MarkQuotaExhausted(acc)
+					}
 				}
 			}
-		}
 
-		p.refreshMu.Lock()
-		p.refreshDone++
-		p.refreshMu.Unlock()
+			p.refreshMu.Lock()
+			p.refreshDone++
+			p.refreshMu.Unlock()
 
-		// 2. Fetch models
-		models, err := FetchModels(acc)
-		if err != nil {
-			log.Printf("[refresh] %s (%s): model fetch failed: %v", acc.UserName, acc.UserEmail, err)
-		} else if len(models) > 0 {
-			acc.setModels(models)
-			modelsUpdated = true
-			log.Printf("[refresh] %s (%s): fetched %d models", acc.UserName, acc.UserEmail, len(models))
-		}
+			// 2. Fetch models
+			models, err := FetchModels(acc)
+			if err != nil {
+				log.Printf("[refresh] %s (%s): model fetch failed: %v", acc.UserName, acc.UserEmail, err)
+			} else if len(models) > 0 {
+				acc.setModels(models)
+				modelsUpdatedFlag.Store(true)
+				log.Printf("[refresh] %s (%s): fetched %d models", acc.UserName, acc.UserEmail, len(models))
+			}
+		}(acc, quota)
 	}
+	wg.Wait()
+
+	modelsUpdated := modelsUpdatedFlag.Load()
 
 	if modelsUpdated {
 		// Update DefaultModelMap from fetched models

@@ -63,6 +63,8 @@ refresh:
     interval_minutes: 30
     # Quota re-check interval in minutes (minimum time between re-checks of exhausted accounts)
     quota_recheck_minutes: 30
+    # Number of concurrent refresh workers (env: REFRESH_CONCURRENCY, default: 10)
+    concurrency: 10
 browser:
     # User-Agent string
     user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"

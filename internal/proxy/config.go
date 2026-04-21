@@ -59,6 +59,7 @@ type TimeoutConfig struct {
 type RefreshConfig struct {
 	IntervalMinutes     int `yaml:"interval_minutes"`
 	QuotaRecheckMinutes int `yaml:"quota_recheck_minutes"`
+	Concurrency         int `yaml:"concurrency"`
 }
 
 type BrowserConfig struct {
@@ -101,6 +102,7 @@ func DefaultConfig() *Config {
 		Refresh: RefreshConfig{
 			IntervalMinutes:     30,
 			QuotaRecheckMinutes: 30,
+			Concurrency:         10,
 		},
 		Browser: BrowserConfig{
 			UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -212,6 +214,11 @@ func LoadConfig(configPath string) (*Config, error) {
 	if v := os.Getenv("QUOTA_RECHECK_MINUTES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Refresh.QuotaRecheckMinutes = n
+		}
+	}
+	if v := os.Getenv("REFRESH_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Refresh.Concurrency = n
 		}
 	}
 	if v := os.Getenv("USER_AGENT"); v != "" {

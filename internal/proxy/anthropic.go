@@ -1072,6 +1072,18 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 				lastNonQuotaErr = reqErr
 			}
 
+			if reqErr != nil && errors.Is(reqErr, ErrPremiumFeatureUnavailable) {
+				// Premium feature unavailable — account/thread cannot use this model path, try next account
+				log.Printf("[premium] %s premium feature unavailable, trying next account", acc.UserEmail)
+				if !isFirstTurn && session != nil {
+					globalSessionManager.Delete(fingerprint)
+					session = nil
+					isFirstTurn = true
+					isRepeatTurn = false
+				}
+				continue
+			}
+
 			if reqErr != nil {
 				// Non-quota error — if this was a subsequent turn, try clearing session and retrying as first turn
 				if !isFirstTurn && session != nil {
