@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"notion-manager/internal/netutil"
 )
 
 // Config holds all configurable values for notion-manager.
@@ -22,6 +24,7 @@ type Config struct {
 	Timeouts TimeoutConfig     `yaml:"timeouts"`
 	Refresh  RefreshConfig     `yaml:"refresh"`
 	Browser  BrowserConfig     `yaml:"browser"`
+	Register RegisterConfig    `yaml:"register"`
 	ModelMap map[string]string `yaml:"model_map"`
 }
 
@@ -47,6 +50,18 @@ type ProxyConfig struct {
 	DisableNotionPrompt   bool   `yaml:"disable_notion_prompt"`
 	EnableWebSearch       *bool  `yaml:"enable_web_search"`
 	EnableWorkspaceSearch *bool  `yaml:"enable_workspace_search"`
+	// AskModeDefault toggles Notion's ASK mode (frontend "Answers only,
+	// won't make edits" — config.useReadOnlyMode=true on the workflow
+	// thread). When true, all chat requests run in read-only mode by
+	// default; per-request callers can still override via the model
+	// suffix `-ask`. nil/false = default mode (model can edit).
+	AskModeDefault *bool `yaml:"ask_mode_default"`
+	// NotionProxy is the optional upstream proxy URL routed in front of every
+	// outbound HTTPS request to notion.so (API calls + reverse-proxy /ai).
+	// Supported schemes: http, https, socks5, socks5h. Empty = direct dial.
+	// The dashboard exposes this field via /admin/settings so operators can
+	// flip the upstream without redeploying.
+	NotionProxy string `yaml:"notion_proxy"`
 }
 
 type TimeoutConfig struct {
@@ -74,6 +89,22 @@ type BrowserConfig struct {
 	SecChUAPlatform string `yaml:"sec_ch_ua_platform"`
 }
 
+// RegisterConfig governs the bulk register history JobStore. Defaults are
+// applied via DefaultConfig so a missing register: section in config.yaml
+// still yields a working setup.
+type RegisterConfig struct {
+	// HistoryFile is the JSON file where completed jobs are persisted. The
+	// path is relative to the working directory (typically the binary's
+	// dir). Default: accounts/.register_history.json
+	HistoryFile string `yaml:"history_file"`
+	// HistoryMemoryCap caps how many jobs are kept in RAM (and reloaded
+	// from disk on startup). Default: 100.
+	HistoryMemoryCap int `yaml:"history_memory_cap"`
+	// DefaultConcurrency is the value pre-filled in the dashboard's
+	// register modal. The runner has no hard upper bound. Default: 1.
+	DefaultConcurrency int `yaml:"default_concurrency"`
+}
+
 // AppConfig is the global configuration instance
 var AppConfig *Config
 
@@ -98,6 +129,7 @@ func DefaultConfig() *Config {
 			DefaultModel:          "opus-4.6",
 			EnableWebSearch:       boolPtr(true),
 			EnableWorkspaceSearch: boolPtr(false),
+			AskModeDefault:        boolPtr(false),
 		},
 		Timeouts: TimeoutConfig{
 			InferenceTimeout: 300,
@@ -115,6 +147,11 @@ func DefaultConfig() *Config {
 			UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
 			SecChUA:         `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
 			SecChUAPlatform: `"Windows"`,
+		},
+		Register: RegisterConfig{
+			HistoryFile:        "accounts/.register_history.json",
+			HistoryMemoryCap:   100,
+			DefaultConcurrency: 1,
 		},
 		ModelMap: map[string]string{
 			"opus-4.6":         "avocado-froyo-medium",
@@ -249,6 +286,33 @@ func LoadConfig(configPath string) (*Config, error) {
 	if v := os.Getenv("ENABLE_WORKSPACE_SEARCH"); v != "" {
 		b := strings.EqualFold(v, "true") || v == "1"
 		cfg.Proxy.EnableWorkspaceSearch = &b
+	}
+	if v := os.Getenv("ASK_MODE_DEFAULT"); v != "" {
+		b := strings.EqualFold(v, "true") || v == "1"
+		cfg.Proxy.AskModeDefault = &b
+	}
+	if v := os.Getenv("NOTION_PROXY"); v != "" {
+		cfg.Proxy.NotionProxy = strings.TrimSpace(v)
+	}
+	// Validate the configured proxy URL once at startup; an invalid scheme
+	// is logged and cleared so the runtime fails closed (direct dial)
+	// rather than leaking the misconfigured URL into every notion request.
+	if cfg.Proxy.NotionProxy != "" {
+		if err := netutil.ValidateProxyURL(cfg.Proxy.NotionProxy); err != nil {
+			log.Printf("[config] invalid notion_proxy %q: %v (falling back to direct dial)", cfg.Proxy.NotionProxy, err)
+			cfg.Proxy.NotionProxy = ""
+		}
+	}
+
+	// Register defaults — fill any zero values that survived YAML parsing.
+	if cfg.Register.HistoryFile == "" {
+		cfg.Register.HistoryFile = "accounts/.register_history.json"
+	}
+	if cfg.Register.HistoryMemoryCap <= 0 {
+		cfg.Register.HistoryMemoryCap = 100
+	}
+	if cfg.Register.DefaultConcurrency <= 0 {
+		cfg.Register.DefaultConcurrency = 1
 	}
 
 	if err := ConfigureLogOutput(cfg.Server.LogFile); err != nil {
@@ -520,6 +584,28 @@ func (c *Config) WorkspaceSearchEnabled() bool {
 		return false
 	}
 	return *c.Proxy.EnableWorkspaceSearch
+}
+
+// AskModeDefault returns the effective default ASK-mode setting (default: false).
+// ASK mode maps to Notion's workflow config.useReadOnlyMode — when true, the
+// model answers without making page edits. Per-request `-ask` suffix on the
+// model name still overrides the default for that single call.
+func (c *Config) AskModeDefault() bool {
+	if c == nil || c.Proxy.AskModeDefault == nil {
+		return false
+	}
+	return *c.Proxy.AskModeDefault
+}
+
+// NotionProxyURL returns the upstream proxy applied to all notion-bound
+// traffic. Empty string means dial directly. Reads from AppConfig at call
+// time so a /admin/settings PUT takes effect on the next dial without a
+// process restart.
+func (c *Config) NotionProxyURL() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.Proxy.NotionProxy)
 }
 
 func boolPtr(b bool) *bool { return &b }

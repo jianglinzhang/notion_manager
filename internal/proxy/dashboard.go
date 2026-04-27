@@ -175,7 +175,9 @@ func (da *DashboardAuth) HandleAuthCheck() http.HandlerFunc {
 
 // --- Account Pool helpers ---
 
-// GetAccountByEmail returns a specific account by email
+// GetAccountByEmail returns a specific account by email regardless of
+// usability (callers like the dashboard "copy token" action want the raw
+// record even for accounts that the picker would skip).
 func (p *AccountPool) GetAccountByEmail(email string) *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -297,6 +299,17 @@ func HandleProxyStart(pool *AccountPool, rp *ReverseProxy, auth *DashboardAuth) 
 		if acc == nil {
 			w.Header().Set("Content-Type", "application/json")
 			http.Error(w, `{"error":"account not found or all exhausted"}`, http.StatusNotFound)
+			return
+		}
+
+		// Refuse to redirect into an account whose Notion workspace is
+		// missing — the SPA loops on a skeleton screen forever and the
+		// user perceives it as a reverse-proxy hang. Surface a clear
+		// error so the dashboard can show "this account has no
+		// workspace" instead of opening a dead tab.
+		if pool.HasNoWorkspace(acc) {
+			w.Header().Set("Content-Type", "application/json")
+			http.Error(w, `{"error":"account has no accessible workspace; pick another or re-register"}`, http.StatusConflict)
 			return
 		}
 

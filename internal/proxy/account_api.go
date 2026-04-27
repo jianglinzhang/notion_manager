@@ -328,20 +328,6 @@ func (p *AccountPool) AddAccount(acc *Account) {
 	log.Printf("[account] added: %s (%s) [%s]", acc.UserName, acc.UserEmail, acc.PlanType)
 }
 
-// RemoveAccountByEmail removes an account from the pool by email.
-func (p *AccountPool) RemoveAccountByEmail(email string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for i, acc := range p.accounts {
-		if acc.UserEmail == email {
-			p.accounts = append(p.accounts[:i], p.accounts[i+1:]...)
-			log.Printf("[account] removed: %s (%s)", acc.UserName, acc.UserEmail)
-			return true
-		}
-	}
-	return false
-}
-
 // DeleteAccountFile removes the JSON file for an account from the accounts directory.
 func DeleteAccountFile(email, dir string) error {
 	entries, err := os.ReadDir(dir)

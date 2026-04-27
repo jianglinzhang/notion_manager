@@ -767,6 +767,20 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			model = AppConfig.Proxy.DefaultModel
 		}
 
+		// ── ASK mode resolution ──
+		// 1. Per-request override via "-ask" suffix on the model name
+		//    (e.g. "claude-sonnet-4.6-ask"). Stripped before logging so
+		//    downstream model-resolution sees the canonical name.
+		// 2. Global default from /admin/settings (ask_mode_default).
+		// Either source flips Notion's workflow useReadOnlyMode flag,
+		// matching the frontend's "Ask" toggle.
+		stripped, askFromModel := StripAskModeSuffix(model)
+		if askFromModel {
+			log.Printf("[ask-mode] %q -> %q (per-request override)", model, stripped)
+		}
+		model = stripped
+		useReadOnlyMode := askFromModel || AppConfig.AskModeDefault()
+
 		// ── Detailed request logging ──
 		logAnthropicRequest(req, model)
 
@@ -1055,9 +1069,9 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					reqErr = handleResearcherNonStream(w, acc, requestMessages, model, requestID, hasThinking)
 				}
 			} else if req.Stream {
-				reqErr = handleAnthropicStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, req.OutputConfig, currentSession)
+				reqErr = handleAnthropicStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, uploadedAttachments, req.OutputConfig, currentSession)
 			} else {
-				reqErr = handleAnthropicNonStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, req.OutputConfig, currentSession)
+				reqErr = handleAnthropicNonStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, uploadedAttachments, req.OutputConfig, currentSession)
 			}
 
 			// Trigger an async live quota refresh after every call so the next
@@ -1417,6 +1431,11 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 	var fullContent strings.Builder
 	var thinkingForLog strings.Builder
 	var finalUsage *UsageInfo
+	defer func() {
+		if finalUsage != nil && acc != nil {
+			GlobalUsageStats().Record(acc.UserEmail, model, finalUsage.PromptTokens, finalUsage.CompletionTokens)
+		}
+	}()
 	var knownCitationURLs []string
 	var knownCitationDocs []CitationCandidate
 	knownToolCallURLs := make(map[string][]string)
@@ -1664,9 +1683,14 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 }
 
 // handleAnthropicStream handles streaming Anthropic response
-func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
+func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
 	var fullContent strings.Builder
 	var finalUsage *UsageInfo
+	defer func() {
+		if finalUsage != nil && acc != nil {
+			GlobalUsageStats().Record(acc.UserEmail, model, finalUsage.PromptTokens, finalUsage.CompletionTokens)
+		}
+	}()
 	var nativeToolUses []AgentValueEntry
 	var thinkingBlocks []ThinkingBlock
 	var knownCitationURLs []string
@@ -1679,6 +1703,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		ThinkingBlocks:        &thinkingBlocks,
 		EnableWebSearch:       enableWebSearch,
 		EnableWorkspaceSearch: enableWorkspaceSearch,
+		UseReadOnlyMode:       useReadOnlyMode,
 		Attachments:           attachments,
 		KnownCitationURLs:     &knownCitationURLs,
 		KnownCitationDocs:     &knownCitationDocs,
@@ -1936,9 +1961,14 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 }
 
 // handleAnthropicNonStream handles non-streaming Anthropic response
-func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
+func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
 	var fullContent strings.Builder
 	var finalUsage *UsageInfo
+	defer func() {
+		if finalUsage != nil && acc != nil {
+			GlobalUsageStats().Record(acc.UserEmail, model, finalUsage.PromptTokens, finalUsage.CompletionTokens)
+		}
+	}()
 	var nativeToolUses []AgentValueEntry
 	var thinkingBlocks []ThinkingBlock
 	var thinkingProcess strings.Builder
@@ -1951,6 +1981,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		ThinkingBlocks:        &thinkingBlocks,
 		EnableWebSearch:       enableWebSearch,
 		EnableWorkspaceSearch: enableWorkspaceSearch,
+		UseReadOnlyMode:       useReadOnlyMode,
 		Attachments:           attachments,
 		KnownCitationURLs:     &knownCitationURLs,
 		KnownCitationDocs:     &knownCitationDocs,
@@ -2288,6 +2319,11 @@ func handleResearcherStream(w http.ResponseWriter, acc *Account, messages []Chat
 	}
 
 	var finalUsage *UsageInfo
+	defer func() {
+		if finalUsage != nil && acc != nil {
+			GlobalUsageStats().Record(acc.UserEmail, model, finalUsage.PromptTokens, finalUsage.CompletionTokens)
+		}
+	}()
 	var thinkingForLog strings.Builder
 	var textForLog strings.Builder
 	blockIndex := 0
@@ -2499,6 +2535,11 @@ func handleResearcherStream(w http.ResponseWriter, acc *Account, messages []Chat
 func handleResearcherNonStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasThinking bool) error {
 	var fullContent strings.Builder
 	var finalUsage *UsageInfo
+	defer func() {
+		if finalUsage != nil && acc != nil {
+			GlobalUsageStats().Record(acc.UserEmail, model, finalUsage.PromptTokens, finalUsage.CompletionTokens)
+		}
+	}()
 	var thinkingBlocks []ThinkingBlock
 
 	callOpts := CallOptions{

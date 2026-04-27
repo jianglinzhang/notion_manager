@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"notion-manager/internal/netutil"
 )
 
 const (
@@ -43,11 +46,17 @@ func NewReverseProxy(pool *AccountPool) *ReverseProxy {
 		pool: pool,
 		// Engine.IO requires sticky sessions: AWS ALB uses AWSALBAPP-0 cookie.
 		// CookieJar stores these cookies so subsequent requests hit the same backend.
+		// DialContext routes through AppConfig.Proxy.NotionProxy at dial
+		// time so a /admin/settings flip applies to new msgstore
+		// connections without restarting the process.
 		msgClient: func() *http.Client {
 			jar, _ := cookiejar.New(nil)
 			return &http.Client{
 				Jar: jar,
 				Transport: &http.Transport{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return netutil.DialThroughProxy(ctx, network, addr, AppConfig.NotionProxyURL())
+					},
 					ForceAttemptHTTP2:   false,
 					TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 					MaxIdleConnsPerHost: 10,
@@ -491,14 +500,25 @@ func (rp *ReverseProxy) proxyWebSocket(w http.ResponseWriter, r *http.Request, s
 	}
 	defer clientConn.Close()
 
-	// Connect to target with HTTP/1.1 only (WebSocket requires HTTP/1.1)
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	targetConn, err := tls.DialWithDialer(dialer, "tcp", targetHost+":443", &tls.Config{
+	// Connect to target with HTTP/1.1 only (WebSocket requires HTTP/1.1).
+	// Tunnel through the configured global notion proxy when set so the
+	// real-time channel obeys the same egress policy as the rest of the
+	// reverse proxy.
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer dialCancel()
+	rawConn, err := netutil.DialThroughProxy(dialCtx, "tcp", targetHost+":443", AppConfig.NotionProxyURL())
+	if err != nil {
+		log.Printf("[rproxy-ws] dial %s error: %v", targetHost, err)
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+	targetConn := tls.Client(rawConn, &tls.Config{
 		ServerName: targetHost,
 		NextProtos: []string{"http/1.1"},
 	})
-	if err != nil {
-		log.Printf("[rproxy-ws] dial %s error: %v", targetHost, err)
+	if err := targetConn.HandshakeContext(dialCtx); err != nil {
+		rawConn.Close()
+		log.Printf("[rproxy-ws] tls handshake %s: %v", targetHost, err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}

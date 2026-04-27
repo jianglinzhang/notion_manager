@@ -51,9 +51,23 @@ proxy:
     # Enable workspace search (Notion internal pages/databases).
     # Can be overridden per-request via X-Workspace-Search header.
     enable_workspace_search: false
+    # Optional upstream proxy applied to every Notion-bound connection
+    # (API calls + reverse-proxy /ai HTML/API/msgstore + WebSocket).
+    # Per-job proxies in the bulk-register modal take priority; an empty
+    # modal value falls back to this global URL. Empty here = direct dial.
+    # Supported schemes: http, https, socks5, socks5h.
+    # Editable at runtime via the dashboard's "API 设置 → 全局代理".
+    notion_proxy: ""
+    # Default ASK mode (Notion's "Answers only, won't make edits" toggle).
+    # When true every /v1/messages request runs in read-only mode unless the
+    # caller appends "-ask" to the model name (the suffix is OR'd, not
+    # subtractive — it cannot disable a true global default).
+    ask_mode_default: false
 timeouts:
     # Inference (streaming) request timeout in seconds
     inference_timeout: 300
+    # Long-running researcher / fast-researcher request timeout in seconds
+    research_timeout: 360
     # API request timeout (models/quota check) in seconds
     api_timeout: 30
     # TLS dial timeout in seconds
@@ -65,6 +79,17 @@ refresh:
     quota_recheck_minutes: 30
     # Number of concurrent refresh workers (env: REFRESH_CONCURRENCY, default: 10)
     concurrency: 10
+    # Per-request live quota check window. A request always re-checks an
+    # account whose cached quota is older than this many seconds. Set to 0
+    # to live-check on every request (slower but most up-to-date). Default: 5.
+    live_check_seconds: 5
+register:
+    # Persistence file for the bulk-register job history (created on first run).
+    history_file: "accounts/.register_history.json"
+    # How many completed jobs to keep in memory / reload on startup.
+    history_memory_cap: 100
+    # Pre-filled "concurrency" value in the bulk-register modal.
+    default_concurrency: 1
 browser:
     # User-Agent string
     user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"

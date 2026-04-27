@@ -111,14 +111,41 @@ Research mode is available on **paid plans only** (`plus`, `business`, `enterpri
 
 ### Data Source
 
-The dashboard fetches from `GET /admin/accounts` with `Authorization: Bearer <api-key>`.
+The dashboard fetches from `GET /admin/accounts` with the dashboard
+session cookie (or `Authorization: Bearer <api-key>`).
+
+Pagination params (all optional): `?q=<substr>&page=<n>&page_size=<n>`.
+- Without any params, the response is the full unsorted list (legacy
+  shape; kept for scripts/integrations).
+- With any param the server filters by `q` (matches email/name/plan/space,
+  case-insensitive), sorts by health (healthy/most-remaining first,
+  exhausted/no-workspace/permanent to the bottom), and slices to the
+  requested page. `page_size` is clamped to `[1, 500]` (default 50).
+- The pool-wide `summary` block is always returned and is computed
+  across ALL accounts regardless of `q` — that way the headline cards
+  stay stable while the user searches.
 
 Response shape:
 ```json
 {
-  "total": 11,
-  "available": 11,
+  "total": 247,
+  "available": 130,
+  "filtered_total": 12,
+  "page": 0,
+  "page_size": 20,
   "models": [{ "id": "...", "name": "..." }],
+  "summary": {
+    "exhausted_only": 4,
+    "no_workspace": 2,
+    "premium_accounts": 5,
+    "research_limited": 6,
+    "total_research_usage": 14,
+    "total_remaining": 12345,
+    "total_space_usage": 1000, "total_space_limit": 4000,
+    "total_user_usage": 1100, "total_user_limit": 4000,
+    "total_space_remaining": 3000, "total_user_remaining": 2900,
+    "total_premium_balance": 500, "total_premium_limit": 1000
+  },
   "accounts": [{
     "email": "...",
     "name": "...",
@@ -147,6 +174,9 @@ Response shape:
 - All component code lives in `App.tsx` (single-file for now; split when it grows)
 - No external UI library — TailwindCSS utility classes only
 - Responsive: 5-col summary grid → 2-col on tablet → 1-col on mobile
-- Account cards sorted: available first (by remaining desc), then exhausted
-- Search filters client-side on name, email, plan, workspace
+- Account cards sorted server-side: healthy (most remaining first), then
+  research-limited, then exhausted, then no-workspace, then permanent
+- Search is debounced 250ms and forwarded to the server as `?q=`; the
+  server filters across all accounts on email/name/plan/workspace
+- Pagination: 20 cards per page, fetched on demand (`?page=&page_size=`)
 - Keyboard shortcut: `/` focuses search, `Escape` blurs
