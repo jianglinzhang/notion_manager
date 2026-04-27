@@ -12,6 +12,7 @@
   </p>
 
   <p>
+    <a href="#quick-start">Quick Start</a> •
     <a href="#core-capabilities">Core Capabilities</a> •
     <a href="#architecture">Architecture</a> •
     <a href="#setup">Setup</a> •
@@ -34,8 +35,48 @@
 
 - `Dashboard` at `/dashboard/` — pool view, token usage stats, bulk register
 - `Reverse Proxy` for the full Notion AI web UI at `/ai`
-- `Anthropic Messages API` at `POST /v1/messages`
+- `API gateway` — `POST /v1/messages` (Anthropic), `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models` (OpenAI), with `GET /models` as an alias
 - `Bulk register` at `POST /admin/register/start` (provider-pluggable)
+
+## Quick Start
+
+> **Prerequisites:** Go 1.25+, at least one Notion account. No Chrome extension needed if you only plan to add accounts via the dashboard.
+
+```bash
+# 1. Clone & run (config auto-generated on first start)
+git clone https://github.com/SleepingBag945/notion_manager.git
+cd notion_manager
+go run ./cmd/notion-manager
+```
+
+On first run, the console prints your **admin password** and **API key** — save them.
+
+```bash
+# 2. Open the Dashboard
+http://localhost:8081/dashboard/
+```
+
+**Add your first account** (pick one):
+
+- **Existing Notion session** — In Chrome open `notion.so` → `F12` → **Application** → **Cookies** → copy `token_v2`. In the Dashboard click **「+ 添加账号」** and paste it.
+- **Bulk Microsoft-SSO** — In the Dashboard click **「注册账号」** and paste `email----password----client_id----refresh_token` lines. See [Bulk Registration](docs/registration.md) for credential prep.
+
+The pool hot-reloads as soon as a new JSON lands in `accounts/` — no restart needed.
+
+```bash
+# 3. Use the API (Claude Code, Cherry Studio, curl, etc.)
+export ANTHROPIC_BASE_URL=http://localhost:8081
+export ANTHROPIC_API_KEY=<your-api-key>
+claude  # or any Anthropic-compatible client
+
+# OpenAI-compatible clients hit the same server:
+export OPENAI_BASE_URL=http://localhost:8081/v1
+export OPENAI_API_KEY=<your-api-key>
+```
+
+Or download a pre-built binary from [Releases](https://github.com/SleepingBag945/notion_manager/releases) — no Go toolchain required.
+
+---
 
 ## Core Capabilities
 
@@ -68,14 +109,19 @@
 - Rewrite Notion frontend base URLs and strip analytics scripts
 - Refuse to redirect into an account whose Notion workspace is missing (returns `409` so the dashboard can show the user instead of opening a dead tab)
 
-### Anthropic-compatible API
+### API compatibility (Anthropic + OpenAI)
 
-- `POST /v1/messages`
+- `POST /v1/messages` — Anthropic Messages API
+- `POST /v1/chat/completions` — OpenAI Chat Completions API
+- `POST /v1/responses` — OpenAI Responses API
+- `GET /v1/models` — OpenAI models API
+- `GET /models` — compatibility alias for `/v1/models`
 - Supports both `Authorization: Bearer <api_key>` and `x-api-key: <api_key>`
 - Streaming and non-streaming responses
-- Anthropic `tools`
-- File content blocks for images, PDFs, and CSVs
+- Anthropic `tools` and OpenAI `tools` / `function_call`
+- File inputs for images, PDFs, and CSVs reuse the existing Notion upload pipeline
 - Default model fallback via `proxy.default_model`
+- `previous_response_id` is intentionally unsupported in `/v1/responses` (stateless bridge)
 - **ASK mode** — append `-ask` to any model name (e.g. `sonnet-4.6-ask`) for a read-only single turn that mirrors Notion's frontend "Ask" toggle, or set `proxy.ask_mode_default: true` to make every request ASK by default
 
 ### Bulk Microsoft-SSO registration
@@ -173,8 +219,8 @@ graph TD
 
 ### Requirements
 
-- Go `1.25+`
-- Chrome or Chromium for the extension workflow
+- Go `1.25+` (or grab a [Release](https://github.com/SleepingBag945/notion_manager/releases) pre-built binary if you want to skip the Go toolchain)
+- Chrome or Chromium for the extension workflow (skip if you only use the dashboard "Add account" or bulk register)
 - At least one usable Notion account
 
 The repo already includes embedded dashboard assets, so `go run` is enough if you only want to run the service.
@@ -277,7 +323,7 @@ curl http://localhost:3000/v1/messages \
 
 ## Documentation
 
-- [API Usage](docs/api.md) — Standard requests, search overrides, file uploads, research mode, ASK mode
+- [API Usage](docs/api.md) — Standard requests, OpenAI compatibility, search overrides, file uploads, research mode, ASK mode
 - [Dashboard & Proxy](docs/dashboard.md) — Dashboard login, pool view, register drawer, stats panel, proxy session workflow
 - [Bulk Registration](docs/registration.md) — Microsoft-SSO provisioning, providers, jobs, SSE, retry, sidecar inputs
 - [Configuration](docs/configuration.md) — Full config reference, endpoints, environment variables

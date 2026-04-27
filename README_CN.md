@@ -12,6 +12,7 @@
   </p>
 
   <p>
+    <a href="#快速开始">快速开始</a> •
     <a href="#核心能力">核心能力</a> •
     <a href="#系统架构">系统架构</a> •
     <a href="#安装与启动">安装与启动</a> •
@@ -34,8 +35,48 @@
 
 - `Dashboard`：账号池、Token 用量统计、批量注册抽屉
 - `Reverse Proxy`：在本地浏览器中直接使用完整的 Notion AI 页面（`/ai`）
-- `Anthropic Messages API`：通过 `POST /v1/messages` 以标准协议调用 Notion AI
+- `API 网关`：`POST /v1/messages`（Anthropic）、`POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/models`（OpenAI），`GET /models` 为兼容别名
 - `批量注册`：`POST /admin/register/start`，Provider 抽象（已内置 Microsoft）
+
+## 快速开始
+
+> **前置要求：** Go 1.25+，至少一个 Notion 账号。如果只用 Dashboard 添加账号，可以不用安装 Chrome 扩展。
+
+```bash
+# 1. 克隆并启动（首次启动自动生成配置）
+git clone https://github.com/SleepingBag945/notion_manager.git
+cd notion_manager
+go run ./cmd/notion-manager
+```
+
+首次启动时控制台会打印 **管理密码** 和 **API Key** —— 请务必保存。
+
+```bash
+# 2. 打开 Dashboard
+http://localhost:8081/dashboard/
+```
+
+**添加第一个账号**（任选其一）：
+
+- **已登录的 Notion 会话** —— 在 Chrome 打开 `notion.so` → `F12` → **Application** → **Cookies** → 复制 `token_v2`，在 Dashboard 点击 **「+ 添加账号」** 粘贴即可。
+- **Microsoft SSO 批量注册** —— 在 Dashboard 点击 **「注册账号」**，粘贴 `email----password----client_id----refresh_token` 多行凭据。凭据准备方式见 [批量注册文档](docs/registration_cn.md)。
+
+只要有新的 JSON 文件落到 `accounts/` 下，账号池会自动热加载，无需重启。
+
+```bash
+# 3. 调用 API（Claude Code、Cherry Studio、curl 等）
+export ANTHROPIC_BASE_URL=http://localhost:8081
+export ANTHROPIC_API_KEY=<your-api-key>
+claude  # 或任何 Anthropic 兼容客户端
+
+# OpenAI 兼容客户端走同一服务：
+export OPENAI_BASE_URL=http://localhost:8081/v1
+export OPENAI_API_KEY=<your-api-key>
+```
+
+也可以直接从 [Releases](https://github.com/SleepingBag945/notion_manager/releases) 下载预编译二进制，无需 Go 工具链。
+
+---
 
 ## 核心能力
 
@@ -70,14 +111,19 @@
 - 会动态改写 `CONFIG.domainBaseUrl`，并过滤分析脚本
 - 对没有 workspace 的账号直接返回 `409`，避免 Dashboard 把用户带进“无限骨架屏”的死页
 
-### 4. Anthropic 协议兼容 API
+### 4. API 协议兼容层（Anthropic + OpenAI）
 
-- 提供 `POST /v1/messages`
+- `POST /v1/messages` —— Anthropic Messages API
+- `POST /v1/chat/completions` —— OpenAI Chat Completions API
+- `POST /v1/responses` —— OpenAI Responses API
+- `GET /v1/models` —— OpenAI Models API
+- `GET /models` —— `/v1/models` 的兼容别名
 - 同时支持 `Authorization: Bearer <api_key>` 和 `x-api-key: <api_key>`
 - 支持流式与非流式响应
-- 支持 Anthropic `tools`
-- 支持图片、PDF、CSV 文件内容块，自动走 Notion 上传链路
+- 同时支持 Anthropic `tools` 与 OpenAI `tools` / `function_call`
+- 图片、PDF、CSV 文件输入会复用现有的 Notion 上传链路
 - 请求里未指定 `model` 时，自动回退到 `proxy.default_model`
+- `/v1/responses` 暂不支持 `previous_response_id`（当前实现是无状态桥接）
 - **ASK 模式**：模型名追加 `-ask` 后缀（如 `sonnet-4.6-ask`）即可对应 Notion 前端 “Ask” 开关（`useReadOnlyMode=true`）；也可设置 `proxy.ask_mode_default: true` 使所有请求默认进入 ASK 模式
 
 ### 5. Microsoft SSO 批量注册
@@ -186,8 +232,8 @@ graph TD
 
 ### 前置要求
 
-- Go `1.25` 或更高版本
-- Chrome / Chromium，用于加载扩展并提取账号
+- Go `1.25` 或更高版本（也可直接从 [Releases](https://github.com/SleepingBag945/notion_manager/releases) 下载预编译二进制，无需安装 Go 工具链）
+- Chrome / Chromium，用于加载扩展并提取账号（如果你只用 Dashboard 加号或批量注册，可跳过）
 - 至少一个可用的 Notion 账号
 
 仓库已经包含内嵌好的 Dashboard 前端资源；如果你只是运行服务，不需要先编译前端。
@@ -290,7 +336,7 @@ curl http://localhost:3000/v1/messages \
 
 ## 详细文档
 
-- [API 接入](docs/api_cn.md) — 标准请求、搜索控制、文件上传、研究模式、ASK 模式
+- [API 接入](docs/api_cn.md) — 标准请求、OpenAI 兼容、搜索控制、文件上传、研究模式、ASK 模式
 - [Dashboard 与代理](docs/dashboard_cn.md) — 登录认证、池视图、注册抽屉、统计面板、代理会话
 - [批量注册](docs/registration_cn.md) — Microsoft SSO 批量开号、Provider、Job、SSE、重试、sidecar 输入
 - [配置说明](docs/configuration_cn.md) — 完整配置参考、端点列表、环境变量、项目结构、使用建议
