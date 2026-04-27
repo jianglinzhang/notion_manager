@@ -142,8 +142,16 @@ func main() {
 		log.Printf("[warn] No accounts found. Place account JSON files in %s/ to enable API and proxy.", accountsDir)
 	}
 
-	// Startup refresh: check quota + fetch models for all accounts (async, non-blocking)
-	go pool.RefreshAll(accountsDir)
+	// Startup refresh: check quota + fetch models for all accounts in the
+	// background. The HTTP listener must come up immediately — large
+	// account pools can take minutes to refresh, and we have a per-request
+	// live quota check that disables exhausted accounts before they can
+	// serve traffic, plus the refresh worker itself marks accounts as
+	// exhausted via applyQuotaInfo as soon as a check completes.
+	if pool.Count() > 0 {
+		log.Printf("[startup] kicking off background quota refresh for %d account(s)", pool.Count())
+		go pool.RefreshAll(accountsDir)
+	}
 
 	// Background refresh loop
 	pool.StartRefreshLoop(cfg.RefreshInterval(), accountsDir)

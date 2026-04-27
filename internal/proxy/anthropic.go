@@ -853,10 +853,11 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 		}
 
+		// Convert Anthropic tools to internal Tool format (done once, immutable).
+		var convertedTools []Tool
 		if hasTools {
-			var tools []Tool
 			for _, t := range req.Tools {
-				tools = append(tools, Tool{
+				convertedTools = append(convertedTools, Tool{
 					Type: "function",
 					Function: ToolFunction{
 						Name:        t.Name,
@@ -869,20 +870,11 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// Injecting them as custom tools causes the model to generate JSON tool calls
 			// instead of using Notion's server-side search which actually executes.
 			var toolDetectedWebSearch bool
-			tools, toolDetectedWebSearch = filterNativeSearchTools(tools)
+			convertedTools, toolDetectedWebSearch = filterNativeSearchTools(convertedTools)
 			if toolDetectedWebSearch {
 				enableWebSearch = true
 				log.Printf("[bridge] WebSearch/WebFetch detected — enabling Notion native search, stripping history")
 				messages = stripWebSearchHistory(messages)
-			}
-			messages = injectToolsIntoMessages(messages, tools, model, session, req.ToolChoice)
-			// Log messages after tool injection only when verbose debugging is enabled.
-			if DebugLoggingEnabled() {
-				log.Printf("[debug] === After tool injection (%d messages) ===", len(messages))
-				for i, m := range messages {
-					preview := truncateForLog(m.Content, 300)
-					log.Printf("[debug]   [%d] role=%s toolcalls=%d content_len=%d: %s", i, m.Role, len(m.ToolCalls), len(m.Content), preview)
-				}
 			}
 		} else if !isResearcher && req.OutputConfig != nil && req.OutputConfig.Format != nil && req.OutputConfig.Format.Type == "json_schema" {
 			messages = applyStructuredOutputBridge(messages, req.OutputConfig)
@@ -895,23 +887,43 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 		}
 
+		// Snapshot the original (pre-injection) messages so failover to a
+		// fresh account can rebuild a self-contained prompt that carries the
+		// full conversation history (the user's "spread the chat to a new
+		// account" requirement).
+		originalMessages := cloneChatMessages(messages)
+
 		// Try accounts with automatic failover
 		tried := make(map[*Account]bool)
 		maxAttempts := pool.Count()
 		var lastNonQuotaErr error
 		var sawEmptyResponse bool
-		var recoveryMessages []ChatMessage
 		var toolRecoveryMessages []ChatMessage
 		toolBridgeRetried := false
+		liveCheckInterval := AppConfig.QuotaLiveCheckInterval()
 
 		for attempt := 0; attempt < maxAttempts; attempt++ {
 			var acc *Account
 
 			// Account binding: for subsequent turns, try the bound account first
+			// — but only if the account still has live quota, otherwise we'd
+			// burn a request just to discover it's exhausted.
 			if !isFirstTurn && session != nil && attempt == 0 {
-				acc = pool.GetByEmail(session.AccountEmail)
-				if acc == nil {
-					log.Printf("[session] bound account %s unavailable, clearing session", session.AccountEmail)
+				bound := pool.GetByEmail(session.AccountEmail)
+				if bound != nil && pool.RefreshAccountQuota(bound, liveCheckInterval) {
+					acc = bound
+				} else {
+					reason := "unavailable"
+					if bound != nil {
+						reason = "quota exhausted on live check"
+					}
+					log.Printf("[session] bound account %s %s, will pick a new account and replay history",
+						session.AccountEmail, reason)
+					if bound != nil && isFreePlan(bound) {
+						pool.RemoveAccount(bound)
+					} else if bound != nil {
+						pool.MarkQuotaExhausted(bound)
+					}
 					globalSessionManager.Delete(fingerprint)
 					session = nil
 					isFirstTurn = true
@@ -920,35 +932,73 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 
 			if acc == nil {
-				if attempt == 0 {
-					if isResearcher {
+				if isResearcher {
+					if attempt == 0 {
 						acc = pool.NextForResearch()
 					} else {
-						acc = pool.Next()
+						// Research-mode fallback also rotates through the pool.
+						acc = pool.NextExcluding(tried)
 					}
+				} else if attempt == 0 {
+					// New-conversation routing: pick the account with the
+					// highest remaining quota so high-quota accounts get used
+					// first, instead of round-robin.
+					acc = pool.NextBest()
 				} else {
-					acc = pool.NextExcluding(tried)
+					// Failover: still prefer high-quota accounts among
+					// accounts we haven't tried yet.
+					acc = pool.NextBestExcluding(tried)
 				}
 			}
 			if acc == nil {
 				break
 			}
+
+			// Live quota pre-check: ensure the cached state is fresh enough
+			// that we don't waste an inference call on an exhausted account.
+			// Researcher mode has its own picker that already inspects quota.
+			if !isResearcher && !pool.RefreshAccountQuota(acc, liveCheckInterval) {
+				log.Printf("[quota-live] %s skipped (exhausted on live check)", acc.UserEmail)
+				tried[acc] = true
+				if isFreePlan(acc) {
+					pool.RemoveAccount(acc)
+				} else {
+					pool.MarkQuotaExhausted(acc)
+				}
+				continue
+			}
 			tried[acc] = true
 
-			requestMessages := messages
+			// Build the request payload for this attempt. We always start
+			// from the pristine `originalMessages` snapshot so a per-attempt
+			// tool injection (which mutates messages in place for large tool
+			// sets) cannot leak into subsequent retries on a different
+			// account.
+			attemptMessages := cloneChatMessages(originalMessages)
+			if hasTools {
+				attemptMessages = injectToolsIntoMessages(attemptMessages, convertedTools, model, session, req.ToolChoice)
+				if DebugLoggingEnabled() && attempt == 0 {
+					log.Printf("[debug] === After tool injection (%d messages) ===", len(attemptMessages))
+					for i, m := range attemptMessages {
+						preview := truncateForLog(m.Content, 300)
+						log.Printf("[debug]   [%d] role=%s toolcalls=%d content_len=%d: %s",
+							i, m.Role, len(m.ToolCalls), len(m.Content), preview)
+					}
+				}
+			}
+
+			requestMessages := attemptMessages
 			if !isResearcher && isFirstTurn {
 				switch {
 				case len(toolRecoveryMessages) > 0:
-					requestMessages = toolRecoveryMessages
-				case needsFreshThreadRecovery(messages):
-					if recoveryMessages == nil {
-						recoveryMessages = buildFreshThreadRecoveryMessages(messages)
-						if len(recoveryMessages) == 1 {
-							log.Printf("[session] collapsed history to self-contained fresh-thread prompt (%d→%d chars)",
-								len(messages), len(recoveryMessages[0].Content))
-						}
+					requestMessages = cloneChatMessages(toolRecoveryMessages)
+				case needsFreshThreadRecovery(attemptMessages):
+					collapsed := buildFreshThreadRecoveryMessages(attemptMessages)
+					if len(collapsed) == 1 {
+						log.Printf("[session] collapsed history to self-contained fresh-thread prompt (%d msgs → %d chars) for account %s",
+							len(attemptMessages), len(collapsed[0].Content), acc.UserEmail)
 					}
-					requestMessages = recoveryMessages
+					requestMessages = collapsed
 				}
 			}
 
@@ -1010,6 +1060,11 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 				reqErr = handleAnthropicNonStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, req.OutputConfig, currentSession)
 			}
 
+			// Trigger an async live quota refresh after every call so the next
+			// selection has up-to-date numbers. Deduplicated per account so
+			// concurrent calls don't trigger redundant Notion API hits.
+			pool.RefreshAccountQuotaAsync(acc)
+
 			if reqErr != nil && errors.Is(reqErr, ErrResearchQuotaExhausted) {
 				// Research mode quota exhausted — account can still serve normal chat
 				quota := acc.quotaInfoSnapshot()
@@ -1024,7 +1079,8 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 			if reqErr != nil && errors.Is(reqErr, ErrQuotaExhausted) {
 				if isFreePlan(acc) {
-					pool.MarkPermanentlyExhausted(acc)
+					log.Printf("[quota] %s (free plan) quota exhausted — removing account", acc.UserEmail)
+					pool.RemoveAccount(acc)
 				} else {
 					pool.MarkQuotaExhausted(acc)
 				}
@@ -1064,12 +1120,28 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					isFirstTurn = true
 					isRepeatTurn = false
 					toolRecoveryMessages = buildToolBridgeRecoveryMessages(messages)
-					recoveryMessages = nil
 					tried = make(map[*Account]bool)
 					attempt = -1
 					continue
 				}
 				lastNonQuotaErr = reqErr
+			}
+
+			if reqErr != nil && errors.Is(reqErr, ErrPremiumFeatureUnavailable) {
+				// Premium feature unavailable — for free accounts this means quota is permanently gone
+				if isFreePlan(acc) {
+					log.Printf("[premium] %s (free plan) premium feature unavailable — removing account", acc.UserEmail)
+					pool.RemoveAccount(acc)
+				} else {
+					log.Printf("[premium] %s premium feature unavailable, trying next account", acc.UserEmail)
+				}
+				if !isFirstTurn && session != nil {
+					globalSessionManager.Delete(fingerprint)
+					session = nil
+					isFirstTurn = true
+					isRepeatTurn = false
+				}
+				continue
 			}
 
 			if reqErr != nil {

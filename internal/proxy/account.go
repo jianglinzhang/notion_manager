@@ -26,10 +26,17 @@ type AccountPool struct {
 	refreshTotal   int
 	lastRefreshAt  *time.Time
 	lastRefreshErr string
+
+	// Per-account live quota refresh state (key: account pointer)
+	// Used to deduplicate concurrent live quota checks for the same account.
+	liveQuotaMu       sync.Mutex
+	liveQuotaInflight map[*Account]bool
 }
 
 func NewAccountPool() *AccountPool {
-	return &AccountPool{}
+	return &AccountPool{
+		liveQuotaInflight: make(map[*Account]bool),
+	}
 }
 
 type accountQuotaSnapshot struct {
@@ -220,7 +227,7 @@ func (p *AccountPool) LoadSingle(tokenFile string) error {
 func (p *AccountPool) Next() *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.pickBestAccountLocked(nil)
+	return p.pickNextRoundRobin(nil)
 }
 
 // NextForResearch returns the next available account suitable for research mode.
@@ -270,12 +277,44 @@ func (p *AccountPool) NextForResearch() *Account {
 func (p *AccountPool) NextExcluding(exclude map[*Account]bool) *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.pickBestAccountLocked(exclude)
+	return p.pickNextRoundRobin(exclude)
+}
+
+// pickNextRoundRobin returns the first available (non-exhausted, non-excluded)
+// account starting from the rotating index. This gives true round-robin
+// distribution across accounts.
+func (p *AccountPool) pickNextRoundRobin(exclude map[*Account]bool) *Account {
+	n := len(p.accounts)
+	if n == 0 {
+		return nil
+	}
+	start := p.index.Add(1) - 1
+	for i := 0; i < n; i++ {
+		acc := p.accounts[(start+uint64(i))%uint64(n)]
+		if exclude != nil && exclude[acc] {
+			continue
+		}
+		if p.isQuotaExhausted(acc) {
+			continue
+		}
+		return acc
+	}
+	return nil
 }
 
 // pickBestAccountLocked returns the available account with the highest
-// effective remaining quota. Ties are broken by the rotating start index so
-// equally healthy accounts still share traffic.
+// effective remaining quota. Used by GetBestAccount (dashboard) and
+// NextBest/NextBestExcluding (request routing).
+//
+// Selection rules:
+//  1. Skip exhausted/excluded accounts.
+//  2. Among accounts with known quota (QuotaInfo != nil), pick the one with
+//     the most basic remaining (space ⊓ user). Premium accounts are treated
+//     as effectively unlimited (priority overrides basic remaining).
+//  3. If no scored account is available (e.g. all accounts are unrefreshed),
+//     fall back to the first usable account in rotation order so freshly
+//     loaded accounts can still serve traffic before the first refresh
+//     completes.
 func (p *AccountPool) pickBestAccountLocked(exclude map[*Account]bool) *Account {
 	n := len(p.accounts)
 	if n == 0 {
@@ -283,6 +322,7 @@ func (p *AccountPool) pickBestAccountLocked(exclude map[*Account]bool) *Account 
 	}
 	start := p.index.Add(1) - 1
 	var best *Account
+	var fallback *Account
 	bestScore := -1
 	for i := 0; i < n; i++ {
 		acc := p.accounts[(start+uint64(i))%uint64(n)]
@@ -293,12 +333,39 @@ func (p *AccountPool) pickBestAccountLocked(exclude map[*Account]bool) *Account 
 			continue
 		}
 		score := accountQuotaPriority(acc)
+		if score < 0 {
+			// Unknown quota — keep as fallback if no scored account exists
+			if fallback == nil {
+				fallback = acc
+			}
+			continue
+		}
 		if best == nil || score > bestScore {
 			best = acc
 			bestScore = score
 		}
 	}
-	return best
+	if best != nil {
+		return best
+	}
+	return fallback
+}
+
+// NextBest returns the next available account, preferring accounts with the
+// highest remaining basic quota. Used for new conversations (no existing
+// session) so high-quota accounts get used first instead of round-robin.
+func (p *AccountPool) NextBest() *Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.pickBestAccountLocked(nil)
+}
+
+// NextBestExcluding returns the next best available account, excluding the
+// given accounts (used for retries / failover).
+func (p *AccountPool) NextBestExcluding(exclude map[*Account]bool) *Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.pickBestAccountLocked(exclude)
 }
 
 // MarkQuotaExhausted marks an account as quota-exhausted with a timestamp.
@@ -335,6 +402,218 @@ func (p *AccountPool) isQuotaExhausted(acc *Account) bool {
 func (p *AccountPool) MarkPermanentlyExhausted(acc *Account) {
 	acc.markQuotaExhausted(time.Now(), true)
 	log.Printf("[quota] marked %s (%s) as PERMANENTLY exhausted (free plan, no recovery)", acc.UserName, acc.UserEmail)
+}
+
+// quotaApplyResult describes how applyQuotaInfo changed the account state.
+// Caller can use it to emit a human-friendly log line.
+type quotaApplyResult struct {
+	Recovered    bool // was previously exhausted, now eligible
+	NowExhausted bool // is currently not eligible
+	NowPermanent bool // free-plan account that is now permanently exhausted
+	WasPermanent bool // was already permanently flagged before this update
+	BasicLeft    int  // basic remaining after the update (0 if info nil)
+	HasPremium   bool
+}
+
+// applyQuotaInfo records the latest quota check result for the account and
+// updates exhausted/permanent state accordingly. Caller must NOT hold acc.mu.
+// The returned snapshot describes what changed so the caller can log the
+// transition without re-locking.
+func (p *AccountPool) applyQuotaInfo(acc *Account, info *QuotaInfo) quotaApplyResult {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	res := quotaApplyResult{WasPermanent: acc.PermanentlyExhausted}
+	now := time.Now()
+	acc.QuotaInfo = cloneQuotaInfo(info)
+	acc.QuotaCheckedAt = &now
+	if info == nil {
+		return res
+	}
+	res.BasicLeft = basicRemaining(info)
+	res.HasPremium = info.HasPremium
+	if info.IsEligible {
+		if acc.QuotaExhaustedAt != nil {
+			res.Recovered = true
+		}
+		acc.QuotaExhaustedAt = nil
+		acc.PermanentlyExhausted = false
+		return res
+	}
+	res.NowExhausted = true
+	if acc.QuotaExhaustedAt == nil {
+		acc.QuotaExhaustedAt = &now
+	}
+	isFree := false
+	if !(info.HasPremium || info.PremiumLimit > 0 || info.PremiumBalance > 0) {
+		switch strings.ToLower(strings.TrimSpace(acc.PlanType)) {
+		case "personal", "free", "":
+			isFree = true
+		default:
+			isFree = !info.HasPremium
+		}
+	}
+	if isFree {
+		acc.PermanentlyExhausted = true
+		res.NowPermanent = true
+	}
+	return res
+}
+
+// RefreshAccountQuota performs a live quota check for a single account.
+//
+//   - When minInterval > 0 and the cached quota was checked recently, returns
+//     the cached eligibility without making an HTTP call. This avoids hammering
+//     the Notion quota API on retry loops.
+//   - Updates the account's QuotaInfo / QuotaExhaustedAt / PermanentlyExhausted
+//     fields atomically based on the live result.
+//
+// Returns true when the account is currently eligible to serve traffic.
+func (p *AccountPool) RefreshAccountQuota(acc *Account, minInterval time.Duration) bool {
+	if acc == nil {
+		return false
+	}
+	// Cached fast path: avoid hammering Notion on tight retry loops.
+	quota := acc.quotaSnapshot()
+	if minInterval > 0 && quota.CheckedAt != nil && time.Since(*quota.CheckedAt) < minInterval {
+		if quota.Info != nil {
+			return quota.Info.IsEligible
+		}
+		return !p.isQuotaExhaustedRLock(acc)
+	}
+	// Mark this account as having an in-flight live check so async callers
+	// do not pile on. We intentionally still proceed even if another check
+	// is running so the synchronous caller gets a fresh decision.
+	p.liveQuotaMu.Lock()
+	p.liveQuotaInflight[acc] = true
+	p.liveQuotaMu.Unlock()
+	defer func() {
+		p.liveQuotaMu.Lock()
+		delete(p.liveQuotaInflight, acc)
+		p.liveQuotaMu.Unlock()
+	}()
+
+	info, err := CheckQuota(acc)
+	if err != nil {
+		log.Printf("[quota-live] %s check failed: %v (using cached state)", acc.UserEmail, err)
+		// On error, trust the cached snapshot — return current eligibility.
+		quota := acc.quotaSnapshot()
+		if quota.Info != nil {
+			return quota.Info.IsEligible
+		}
+		return !p.isQuotaExhaustedRLock(acc)
+	}
+
+	res := p.applyQuotaInfo(acc, info)
+	switch {
+	case res.Recovered:
+		log.Printf("[quota-live] %s recovered (basic remaining ~%d, premium=%v)",
+			acc.UserEmail, res.BasicLeft, res.HasPremium)
+	case res.NowPermanent:
+		log.Printf("[quota-live] %s NOT eligible — disabling permanently (free plan)", acc.UserEmail)
+	case res.NowExhausted:
+		log.Printf("[quota-live] %s NOT eligible — disabled (space %d/%d, user %d/%d)",
+			acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit)
+	default:
+		log.Printf("[quota-live] %s eligible (basic remaining ~%d, premium=%v)",
+			acc.UserEmail, res.BasicLeft, res.HasPremium)
+	}
+	return info.IsEligible
+}
+
+// RefreshAccountQuotaAsync triggers a live quota check in the background.
+// Used to refresh the cached quota after a successful inference call so the
+// next selection sees up-to-date numbers without blocking the user request.
+// Concurrent calls for the same account are deduplicated.
+func (p *AccountPool) RefreshAccountQuotaAsync(acc *Account) {
+	if acc == nil {
+		return
+	}
+	p.liveQuotaMu.Lock()
+	if p.liveQuotaInflight[acc] {
+		p.liveQuotaMu.Unlock()
+		return
+	}
+	p.liveQuotaInflight[acc] = true
+	p.liveQuotaMu.Unlock()
+
+	go func() {
+		defer func() {
+			p.liveQuotaMu.Lock()
+			delete(p.liveQuotaInflight, acc)
+			p.liveQuotaMu.Unlock()
+		}()
+		info, err := CheckQuota(acc)
+		if err != nil {
+			log.Printf("[quota-live-async] %s check failed: %v", acc.UserEmail, err)
+			return
+		}
+		res := p.applyQuotaInfo(acc, info)
+		switch {
+		case res.NowPermanent:
+			log.Printf("[quota-live-async] %s NOT eligible — disabled permanently (free plan)", acc.UserEmail)
+		case res.NowExhausted:
+			log.Printf("[quota-live-async] %s NOT eligible — disabled (basic %d left)", acc.UserEmail, res.BasicLeft)
+		case res.Recovered:
+			log.Printf("[quota-live-async] %s recovered (basic %d left)", acc.UserEmail, res.BasicLeft)
+		}
+	}()
+}
+
+// isQuotaExhaustedRLock is a read-locked variant of isQuotaExhausted for
+// callers that hold no lock yet.
+func (p *AccountPool) isQuotaExhaustedRLock(acc *Account) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.isQuotaExhausted(acc)
+}
+
+// RemoveAccount removes an account from the pool and deletes its JSON file from disk.
+// Used for free-plan accounts that are confirmed exhausted (e.g. premium feature unavailable).
+func (p *AccountPool) RemoveAccount(acc *Account) {
+	p.mu.Lock()
+	for i, a := range p.accounts {
+		if a == acc {
+			p.accounts = append(p.accounts[:i], p.accounts[i+1:]...)
+			break
+		}
+	}
+	p.mu.Unlock()
+
+	// Delete the JSON file from disk
+	dir := ""
+	if AppConfig != nil {
+		dir = AppConfig.Server.AccountsDir
+	}
+	if dir == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var existing map[string]interface{}
+		if err := json.Unmarshal(data, &existing); err != nil {
+			continue
+		}
+		email, _ := existing["user_email"].(string)
+		if email == acc.UserEmail {
+			if err := os.Remove(path); err != nil {
+				log.Printf("[account] failed to delete %s: %v", path, err)
+			} else {
+				log.Printf("[account] deleted exhausted free account file: %s (%s)", path, acc.UserEmail)
+			}
+			break
+		}
+	}
 }
 
 // AvailableCount returns the number of accounts not currently quota-exhausted
@@ -451,31 +730,51 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 	p.refreshTotal = len(accs)
 	p.refreshMu.Unlock()
 
-	log.Printf("[refresh] refreshing %d accounts (quota + models)...", len(accs))
-	modelsUpdated := false
+	concurrency := 10
+	if AppConfig != nil && AppConfig.Refresh.Concurrency > 0 {
+		concurrency = AppConfig.Refresh.Concurrency
+	}
+	log.Printf("[refresh] refreshing %d accounts (quota + models, concurrency=%d)...", len(accs), concurrency)
+
+	var (
+		modelsUpdatedFlag atomic.Bool
+		disabledNow       atomic.Int64
+		recoveredNow      atomic.Int64
+		failedChecks      atomic.Int64
+	)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
 
 	for _, acc := range accs {
 		quota := acc.quotaSnapshot()
 		// Skip permanently exhausted accounts (free plan, no recovery possible)
 		if quota.PermanentlyExhausted {
 			if isFreePlan(acc) {
-				log.Printf("[refresh] %s (%s): ⛔ permanently exhausted (skipped)", acc.UserName, acc.UserEmail)
+				log.Printf("[refresh] %s (%s): permanently exhausted, skipped", acc.UserName, acc.UserEmail)
+				p.refreshMu.Lock()
+				p.refreshDone++
+				p.refreshMu.Unlock()
 				continue
 			}
 			log.Printf("[refresh] %s (%s): clearing stale permanent exhaustion flag before re-check", acc.UserName, acc.UserEmail)
 			p.ClearQuotaExhausted(acc)
 		}
 
-		// 1. Check quota
-		info, err := CheckQuota(acc)
-		if err != nil {
-			log.Printf("[refresh] %s (%s): quota check failed: %v", acc.UserName, acc.UserEmail, err)
-		} else {
-			now := time.Now()
-			acc.setQuotaInfo(info, &now)
+		wg.Add(1)
+		sem <- struct{}{} // acquire semaphore slot
+		go func(acc *Account, quota accountQuotaSnapshot) {
+			defer wg.Done()
+			defer func() { <-sem }() // release semaphore slot
 
-			if info.IsEligible {
-				remaining := basicRemaining(info)
+			// 1. Check quota — applyQuotaInfo handles state transitions and
+			// ensures every write happens under p.mu so concurrent selectors
+			// always observe a consistent view.
+			info, err := CheckQuota(acc)
+			if err != nil {
+				log.Printf("[refresh] %s (%s): quota check failed: %v", acc.UserName, acc.UserEmail, err)
+				failedChecks.Add(1)
+			} else {
+				res := p.applyQuotaInfo(acc, info)
 				premiumInfo := ""
 				if info.HasPremium {
 					premiumInfo = fmt.Sprintf(", premium %d/%d", info.PremiumUsage, info.PremiumLimit)
@@ -483,42 +782,43 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 				if info.ResearchModeUsage > 0 {
 					premiumInfo += fmt.Sprintf(", research=%d", info.ResearchModeUsage)
 				}
-				// If was exhausted, clear the flag — API confirmed recovery
-				if quota.ExhaustedAt != nil {
-					log.Printf("[refresh] %s (%s): ✅ RECOVERED! (space %d/%d, user %d/%d, remaining ~%d%s)",
-						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit, remaining, premiumInfo)
-					p.ClearQuotaExhausted(acc)
-				} else {
-					log.Printf("[refresh] %s (%s): ✅ eligible (space %d/%d, user %d/%d, remaining ~%d%s)",
-						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit, remaining, premiumInfo)
-				}
-			} else {
-				if isFreePlan(acc) {
-					log.Printf("[refresh] %s (%s): ❌ NOT eligible (space %d/%d, user %d/%d, marking permanent)",
+				switch {
+				case res.NowPermanent:
+					log.Printf("[refresh] %s (%s): NOT eligible — disabled permanently (free plan, space %d/%d, user %d/%d)",
 						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit)
-					p.MarkPermanentlyExhausted(acc)
-				} else {
-					log.Printf("[refresh] %s (%s): ❌ NOT eligible (space %d/%d, user %d/%d)",
-						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit)
-					p.MarkQuotaExhausted(acc)
+					disabledNow.Add(1)
+				case res.NowExhausted:
+					log.Printf("[refresh] %s (%s): NOT eligible — disabled (space %d/%d, user %d/%d%s)",
+						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit, premiumInfo)
+					disabledNow.Add(1)
+				case res.Recovered:
+					log.Printf("[refresh] %s (%s): RECOVERED (space %d/%d, user %d/%d, remaining ~%d%s)",
+						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit, res.BasicLeft, premiumInfo)
+					recoveredNow.Add(1)
+				default:
+					log.Printf("[refresh] %s (%s): eligible (space %d/%d, user %d/%d, remaining ~%d%s)",
+						acc.UserName, acc.UserEmail, info.SpaceUsage, info.SpaceLimit, info.UserUsage, info.UserLimit, res.BasicLeft, premiumInfo)
 				}
 			}
-		}
 
-		p.refreshMu.Lock()
-		p.refreshDone++
-		p.refreshMu.Unlock()
+			p.refreshMu.Lock()
+			p.refreshDone++
+			p.refreshMu.Unlock()
 
-		// 2. Fetch models
-		models, err := FetchModels(acc)
-		if err != nil {
-			log.Printf("[refresh] %s (%s): model fetch failed: %v", acc.UserName, acc.UserEmail, err)
-		} else if len(models) > 0 {
-			acc.setModels(models)
-			modelsUpdated = true
-			log.Printf("[refresh] %s (%s): fetched %d models", acc.UserName, acc.UserEmail, len(models))
-		}
+			// 2. Fetch models
+			models, err := FetchModels(acc)
+			if err != nil {
+				log.Printf("[refresh] %s (%s): model fetch failed: %v", acc.UserName, acc.UserEmail, err)
+			} else if len(models) > 0 {
+				acc.setModels(models)
+				modelsUpdatedFlag.Store(true)
+				log.Printf("[refresh] %s (%s): fetched %d models", acc.UserName, acc.UserEmail, len(models))
+			}
+		}(acc, quota)
 	}
+	wg.Wait()
+
+	modelsUpdated := modelsUpdatedFlag.Load()
 
 	if modelsUpdated {
 		// Update DefaultModelMap from fetched models
@@ -539,7 +839,9 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 		p.SaveAccounts(accountsDir)
 	}
 
-	log.Printf("[refresh] complete: %d/%d accounts available", p.AvailableCount(), len(accs))
+	available := p.AvailableCount()
+	log.Printf("[refresh] complete: %d/%d available, disabled=%d, recovered=%d, check_errors=%d",
+		available, len(accs), disabledNow.Load(), recoveredNow.Load(), failedChecks.Load())
 }
 
 // normalizeModelName converts display name like "GPT-5.2" to a user-friendly alias like "gpt-5.2"
@@ -798,12 +1100,31 @@ func basicRemaining(info *QuotaInfo) int {
 	return best
 }
 
+// accountQuotaPriority returns a sortable score for an account's remaining
+// quota. Higher = more preferred when picking the "best" account.
+//
+//   - Unknown quota (QuotaInfo == nil): -1 (treated as fallback in pickBest).
+//   - Premium account: basicRemaining + premiumRemaining (premium credits add
+//     significant headroom so a premium account with low basic credits should
+//     still rank above a basic-only account that's nearly drained).
+//   - Basic-only account: basicRemaining (space ⊓ user).
 func accountQuotaPriority(acc *Account) int {
 	quota := acc.quotaInfoSnapshot()
 	if quota == nil {
 		return -1
 	}
-	return basicRemaining(quota)
+	score := basicRemaining(quota)
+	if quota.HasPremium {
+		// Premium balance often dwarfs basic credits — fold it in so premium
+		// accounts win over basic-only accounts when both are eligible.
+		score += quota.PremiumBalance
+		// If both basic and premium look exhausted but isEligible is still
+		// true (rare), keep premium accounts above unknown-quota fallback.
+		if score <= 0 {
+			score = 1
+		}
+	}
+	return score
 }
 
 func generateUUIDv4() string {

@@ -59,6 +59,13 @@ type TimeoutConfig struct {
 type RefreshConfig struct {
 	IntervalMinutes     int `yaml:"interval_minutes"`
 	QuotaRecheckMinutes int `yaml:"quota_recheck_minutes"`
+	Concurrency         int `yaml:"concurrency"`
+	// LiveCheckSeconds is the minimum interval (in seconds) between live
+	// per-request quota checks for the same account. A request always
+	// re-checks an account whose cached quota is older than this. Set to 0
+	// to force a live check on every request (slower but most up-to-date).
+	// Default: 5 seconds.
+	LiveCheckSeconds int `yaml:"live_check_seconds"`
 }
 
 type BrowserConfig struct {
@@ -101,6 +108,8 @@ func DefaultConfig() *Config {
 		Refresh: RefreshConfig{
 			IntervalMinutes:     30,
 			QuotaRecheckMinutes: 30,
+			Concurrency:         10,
+			LiveCheckSeconds:    5,
 		},
 		Browser: BrowserConfig{
 			UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -212,6 +221,16 @@ func LoadConfig(configPath string) (*Config, error) {
 	if v := os.Getenv("QUOTA_RECHECK_MINUTES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Refresh.QuotaRecheckMinutes = n
+		}
+	}
+	if v := os.Getenv("REFRESH_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Refresh.Concurrency = n
+		}
+	}
+	if v := os.Getenv("QUOTA_LIVE_CHECK_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Refresh.LiveCheckSeconds = n
 		}
 	}
 	if v := os.Getenv("USER_AGENT"); v != "" {
@@ -473,6 +492,18 @@ func (c *Config) RefreshInterval() time.Duration {
 
 func (c *Config) QuotaRecheckInterval() time.Duration {
 	return time.Duration(c.Refresh.QuotaRecheckMinutes) * time.Minute
+}
+
+// QuotaLiveCheckInterval returns the minimum interval between live per-request
+// quota checks for the same account. Defaults to 5 seconds when unset.
+func (c *Config) QuotaLiveCheckInterval() time.Duration {
+	if c == nil {
+		return 5 * time.Second
+	}
+	if c.Refresh.LiveCheckSeconds < 0 {
+		return 0
+	}
+	return time.Duration(c.Refresh.LiveCheckSeconds) * time.Second
 }
 
 // WebSearchEnabled returns the effective web search setting (default: true)

@@ -172,6 +172,24 @@ func shouldCountNonSystemMessage(msg ChatMessage) bool {
 	}
 }
 
+// cloneChatMessages returns a deep copy of the message slice so callers can
+// mutate the copy (e.g. tool injection rewriting Content in place) without
+// affecting the original. Tool call slices are also copied because the
+// underlying ToolCall structs are read-only after construction.
+func cloneChatMessages(src []ChatMessage) []ChatMessage {
+	if src == nil {
+		return nil
+	}
+	out := make([]ChatMessage, len(src))
+	for i, m := range src {
+		out[i] = m
+		if len(m.ToolCalls) > 0 {
+			out[i].ToolCalls = append([]ToolCall(nil), m.ToolCalls...)
+		}
+	}
+	return out
+}
+
 // computeSessionFingerprintWithSalt generates a fingerprint from the message history
 // to identify the same conversation across Anthropic API requests.
 // Strategy: hash(optional stable salt + normalized system prompt prefix + first user message prefix).
