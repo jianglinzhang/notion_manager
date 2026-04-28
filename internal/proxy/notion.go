@@ -1216,6 +1216,25 @@ func IsResearcherModel(model string) bool {
 	return model == "researcher" || model == "fast-researcher"
 }
 
+// StripAskModeSuffix strips a trailing "-ask" mode suffix from the model
+// name and returns (stripped, askEnabled). The suffix is matched
+// case-insensitively. Callers should run this BEFORE ResolveModel so the
+// fuzzy keyword matcher (opus/sonnet/haiku) sees the canonical name.
+//
+// Examples:
+//
+//	"claude-sonnet-4-6-ask"          -> ("claude-sonnet-4-6", true)
+//	"sonnet-4.6-ask"                 -> ("sonnet-4.6", true)
+//	"claude-sonnet-4-6-20250929-ask" -> ("claude-sonnet-4-6-20250929", true)
+//	"claude-sonnet-4-6"              -> ("claude-sonnet-4-6", false)
+func StripAskModeSuffix(model string) (string, bool) {
+	const suffix = "-ask"
+	if len(model) > len(suffix) && strings.EqualFold(model[len(model)-len(suffix):], suffix) {
+		return model[:len(model)-len(suffix)], true
+	}
+	return model, false
+}
+
 // CallInference sends a request to Notion's runInferenceTranscript API
 // and streams the response via callback.
 // When opt.Session is non-nil with TurnCount > 0, it sends a partial transcript (subsequent turn).
@@ -1227,6 +1246,18 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		opt = opts[0]
 	}
 	requestID := opt.RequestID
+
+	// Per-request "-ask" suffix override. Defensive: most callers strip
+	// this in their own pipeline (anthropic.go does), but we re-check here
+	// so any code path that forwards the raw model name still picks up
+	// ASK mode without an extra round-trip.
+	if stripped, ask := StripAskModeSuffix(model); ask {
+		if model != stripped {
+			log.Printf("[ask-mode] model %q stripped → %q (useReadOnlyMode=true)", model, stripped)
+		}
+		model = stripped
+		opt.UseReadOnlyMode = true
+	}
 
 	isResearcher := opt.IsResearcher || IsResearcherModel(model)
 
@@ -1251,7 +1282,7 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		if newUserContent == "" {
 			newUserContent = "continue"
 		}
-		transcript := buildPartialTranscript(acc, newUserContent, notionModel, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, session)
+		transcript := buildPartialTranscript(acc, newUserContent, notionModel, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, session)
 
 		reqBody = NotionInferenceRequest{
 			TraceID:                 generateUUIDv4(),
@@ -1286,7 +1317,7 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 			contextID = generateUUIDv4()
 			now = time.Now().Format(time.RFC3339Nano)
 		}
-		transcript := buildFullTranscript(acc, messages, notionModel, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, attachments, configID, contextID, now)
+		transcript := buildFullTranscript(acc, messages, notionModel, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, attachments, configID, contextID, now)
 
 		// When attachments are present, reuse the upload thread instead of creating a new one.
 		createThread := true
@@ -1376,7 +1407,9 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 
 // buildConfigValue constructs the Notion config value map used in transcript config entries.
 // enableWorkspaceSearch: nil = use AppConfig default, non-nil = per-request override
-func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, hasAttachments bool, isSubsequentTurn bool) map[string]interface{} {
+// useReadOnlyMode: when true, sets Notion's ASK-mode flag — model answers
+// the prompt but skips page edits. Mirrors the frontend's "Ask" mode toggle.
+func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, hasAttachments bool, isSubsequentTurn bool) map[string]interface{} {
 	effectiveDisable := disableBuiltinTools
 
 	// Resolve workspace search: per-request override > config default
@@ -1400,7 +1433,7 @@ func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSea
 		"enableScriptAgent":          !effectiveDisable,
 		"enableCreateAndRunThread":   true,
 		"useWebSearch":               enableWebSearch,
-		"useReadOnlyMode":            false,
+		"useReadOnlyMode":            useReadOnlyMode,
 		"writerMode":                 false,
 		"isCustomAgent":              false,
 		"isCustomAgentBuilder":       false,
@@ -1440,9 +1473,9 @@ func buildContextValue(acc *Account, datetime string) map[string]interface{} {
 
 // buildFullTranscript builds a complete transcript for the first turn of a conversation.
 // Uses ResearcherTranscriptMsg (with id field) to match Notion's real client format.
-func buildFullTranscript(acc *Account, messages []ChatMessage, notionModel string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, configID, contextID, now string) []interface{} {
+func buildFullTranscript(acc *Account, messages []ChatMessage, notionModel string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, configID, contextID, now string) []interface{} {
 	hasAttachments := len(attachments) > 0
-	configValue := buildConfigValue(notionModel, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, hasAttachments, false)
+	configValue := buildConfigValue(notionModel, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, hasAttachments, false)
 	contextValue := buildContextValue(acc, now)
 
 	if hasAttachments {
@@ -1520,8 +1553,8 @@ func buildFullTranscript(acc *Account, messages []ChatMessage, notionModel strin
 
 // buildPartialTranscript builds an incremental transcript for subsequent turns.
 // It includes: config + context (reused IDs) + N updated-config placeholders + new user message.
-func buildPartialTranscript(acc *Account, newUserContent string, notionModel string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, session *Session) []interface{} {
-	configValue := buildConfigValue(notionModel, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, false, true)
+func buildPartialTranscript(acc *Account, newUserContent string, notionModel string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, session *Session) []interface{} {
+	configValue := buildConfigValue(notionModel, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, false, true)
 	contextValue := buildContextValue(acc, session.OriginalDatetime)
 
 	transcript := []interface{}{
@@ -1761,6 +1794,71 @@ func CheckQuota(acc *Account) (*QuotaInfo, error) {
 		info.PremiumBalance > 0
 
 	return info, nil
+}
+
+// CheckUserWorkspace probes /api/v3/loadUserContent and returns the number
+// of accessible workspaces (`user_root.space_views` length) for this
+// account.
+//
+// Background: when an account's Notion onboarding never completed (or the
+// workspace was reaped), Notion still returns a user_root record but with
+// no `space_views` field. The /ai SPA then loops on a skeleton screen
+// because `someSpace.getSpaceId()` runs against `undefined`. Probing this
+// up-front lets the pool blacklist such accounts so the dashboard's
+// "best account" selector and the per-email click never lands on them.
+//
+// 0 with err==nil is a real, sticky signal — not a transient. Callers
+// should persist the result so a restart doesn't have to re-probe every
+// account.
+func CheckUserWorkspace(acc *Account) (int, error) {
+	body := []byte(`{}`)
+	req, err := http.NewRequest("POST", NotionAPIBase+"/loadUserContent", bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("create request: %w", err)
+	}
+	setNotionHeadersJSON(req, acc)
+
+	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 300)]))
+	}
+
+	// We only care about user_root.{userId}.value.value.space_views; using
+	// json.RawMessage keeps us tolerant to schema drift on every other
+	// field.
+	var parsed struct {
+		RecordMap struct {
+			UserRoot map[string]struct {
+				Value struct {
+					Value struct {
+						SpaceViews []string `json:"space_views"`
+					} `json:"value"`
+				} `json:"value"`
+			} `json:"user_root"`
+		} `json:"recordMap"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return 0, fmt.Errorf("parse response: %w", err)
+	}
+	// Prefer the user_root keyed by this account's UserID. If Notion ever
+	// switches to a different keying we still fall back to "any non-empty
+	// space_views in the response" so a transient mismatch doesn't false-
+	// positive an otherwise healthy account.
+	if entry, ok := parsed.RecordMap.UserRoot[acc.UserID]; ok {
+		return len(entry.Value.Value.SpaceViews), nil
+	}
+	for _, entry := range parsed.RecordMap.UserRoot {
+		if n := len(entry.Value.Value.SpaceViews); n > 0 {
+			return n, nil
+		}
+	}
+	return 0, nil
 }
 
 func decompressBody(resp *http.Response) (io.Reader, func(), error) {

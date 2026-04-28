@@ -1,0 +1,82 @@
+{
+  "saved_at": "2026-04-27T04:08:00Z",
+  "account_used": "user1@hotmail.com (cookie-injected from Go SSO)",
+  "notes": [
+    "Captured by injecting Notion cookies obtained via Go SSO into a Playwright browser, then clicking the 'For personal life' onboarding option followed by 'Skip for now' on the desktop-app prompt. The /createSpace response does NOT contain a space_view record; the SPA invents a fresh space_view UUID client-side and then immediately POSTs /api/v3/saveTransactionsMain with a single transaction whose three operations (a) create the space_view, (b) listAfter it onto user_root.space_views, (c) keyedObjectListAfter it onto user_root.space_view_pointers. Only after this transaction does user_root.space_view_pointers become non-empty — which is what /loadUserContent + the proxy use to find the workspace.",
+    "Go must NOT include domainType in the createSpace body (the SPA omits it).",
+    "All UUIDs in transactions/requestId/space_view are client-generated; Notion accepts any well-formed UUID."
+  ],
+  "create_space_request": {
+    "url": "https://www.notion.so/api/v3/createSpace",
+    "method": "POST",
+    "body": {
+      "name": "Test User\u2019s Space",
+      "icon": "\ud83c\udfe0",
+      "planType": "personal",
+      "planSelection": "personal",
+      "initialPersona": "unfilled",
+      "deviceId": "ca1ffa31-b291-475b-a934-ab2b1505af85",
+      "deviceType": "web-desktop",
+      "source": "handle_root_redirect"
+    }
+  },
+  "create_space_response": {
+    "spaceId": "d30a7878-9ff8-81c5-ab71-0003cdab29fa",
+    "recordMap_keys": ["__version__", "space"],
+    "no_space_view": true,
+    "extras": ["inviteLinkCode"]
+  },
+  "save_transactions_main_request": {
+    "url": "https://www.notion.so/api/v3/saveTransactionsMain",
+    "method": "POST",
+    "body": {
+      "requestId": "a9c00242-a424-42e9-b5dc-5bef57c4794d",
+      "transactions": [
+        {
+          "id": "1bea94e8-9622-42c0-8e54-d4fb0b172d08",
+          "spaceId": "d30a7878-9ff8-81c5-ab71-0003cdab29fa",
+          "debug": {"userAction": "spaceActions.createSpace"},
+          "operations": [
+            {
+              "pointer": {"table": "space_view", "id": "34fa7878-9ff8-80ce-98d1-0006018c7f66", "spaceId": "d30a7878-9ff8-81c5-ab71-0003cdab29fa"},
+              "path": [],
+              "command": "set",
+              "args": {
+                "id": "34fa7878-9ff8-80ce-98d1-0006018c7f66",
+                "version": 1,
+                "space_id": "d30a7878-9ff8-81c5-ab71-0003cdab29fa",
+                "notify_mobile": true,
+                "notify_desktop": true,
+                "notify_email": true,
+                "parent_id": "34fd872b-594c-8111-884e-0002fba0838c",
+                "parent_table": "user_root",
+                "alive": true,
+                "first_joined_space_time": 1777262880519,
+                "joined": true,
+                "settings": {"notify_email_digest": true, "notify_home_digest_email": true}
+              }
+            },
+            {
+              "pointer": {"table": "user_root", "id": "34fd872b-594c-8111-884e-0002fba0838c"},
+              "path": ["space_views"],
+              "command": "listAfter",
+              "args": {"id": "34fa7878-9ff8-80ce-98d1-0006018c7f66"}
+            },
+            {
+              "pointer": {"table": "user_root", "id": "34fd872b-594c-8111-884e-0002fba0838c"},
+              "path": ["space_view_pointers"],
+              "command": "keyedObjectListAfter",
+              "args": {
+                "value": {"table": "space_view", "id": "34fa7878-9ff8-80ce-98d1-0006018c7f66", "spaceId": "d30a7878-9ff8-81c5-ab71-0003cdab29fa"}
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "save_transactions_main_response": {
+    "status": 200,
+    "body": "{}"
+  }
+}

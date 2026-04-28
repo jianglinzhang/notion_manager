@@ -5,9 +5,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"notion-manager/internal/proxy"
+	"notion-manager/internal/regjob"
+	"notion-manager/internal/regjob/providers"
+	"notion-manager/internal/regjob/providers/microsoft"
 )
 
 func requiresAPIKey(path string) bool {
@@ -43,7 +48,7 @@ func apiKeyAuthMiddleware(apiKey string, next http.Handler) http.Handler {
 	})
 }
 
-func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth *proxy.DashboardAuth) *http.ServeMux {
+func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth *proxy.DashboardAuth, usageStats *proxy.UsageStats, regDeps *proxy.RegisterJobsDeps) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Anthropic + OpenAI-compatible API endpoints
@@ -63,6 +68,22 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	mux.HandleFunc("/admin/models", proxy.HandleAdminModels(pool, dashAuth))
 	mux.HandleFunc("/admin/refresh", proxy.HandleAdminRefresh(pool, accountsDir, dashAuth))
 	mux.HandleFunc("/admin/settings", proxy.HandleAdminSettings("config.yaml", dashAuth))
+	mux.HandleFunc("/admin/stats", proxy.HandleAdminStats(usageStats, dashAuth))
+
+	// Bulk Microsoft-SSO registration. The legacy synchronous endpoint is
+	// kept for parity with the dashboard's older "submit + wait" UI; the
+	// async Job-based endpoints power the new register drawer (with SSE
+	// progress at /admin/register/jobs/{id}/events).
+	mux.HandleFunc("/admin/register", proxy.HandleAdminRegister(pool, accountsDir, dashAuth))
+	mux.HandleFunc("/admin/register/providers", proxy.HandleAdminRegisterProviders(regDeps))
+	mux.HandleFunc("/admin/register/start", proxy.HandleAdminRegisterStart(regDeps))
+	mux.HandleFunc("/admin/register/jobs", proxy.HandleAdminRegisterJobsList(regDeps))
+	mux.HandleFunc("/admin/register/jobs/", proxy.HandleAdminRegisterJobsRouter(regDeps))
+	// REST-style DELETE /admin/accounts/{email}. Coexists with the older
+	// POST /admin/accounts/delete handler — Go's mux prefers the more
+	// specific exact-match route, so /add and /delete still win over the
+	// catch-all /admin/accounts/.
+	mux.HandleFunc("/admin/accounts/", proxy.HandleAdminDeleteAccount(regDeps))
 
 	// Dashboard (React SPA with embedded API key + auth)
 	mux.Handle("/dashboard/", proxy.HandleDashboard(apiKey, dashAuth))
@@ -83,16 +104,13 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 }
 
 func main() {
-	// Load configuration: config.yaml > env > defaults
 	cfg, err := proxy.LoadConfig("config.yaml")
 	if err != nil {
 		log.Fatalf("[config] %v", err)
 	}
 
-	// Ensure API key exists (generate + write back if missing)
 	proxy.EnsureApiKey(cfg, "config.yaml")
 
-	// Auto-generate admin_password if not set
 	if cfg.Server.AdminPassword == "" {
 		generated := proxy.GenerateAdminPassword()
 		cfg.Server.AdminPassword = generated
@@ -106,17 +124,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "")
 	}
 
-	// Hash admin password on first run (plaintext → SHA256+salt)
 	proxy.EnsureAdminPassword(cfg, "config.yaml")
-
-	// Apply config to package-level variables
 	proxy.ApplyConfig(cfg)
 
 	port := cfg.Server.Port
 	accountsDir := cfg.Server.AccountsDir
 	tokenFile := cfg.Server.TokenFile
 
-	// Load account pool
 	pool := proxy.NewAccountPool()
 
 	if _, err := os.Stat(accountsDir); err == nil {
@@ -125,7 +139,6 @@ func main() {
 		}
 	}
 
-	// Fallback: load from token file or env
 	if pool.Count() == 0 {
 		tokenV2 := os.Getenv("NOTION_TOKEN_V2")
 		if tokenV2 == "" {
@@ -142,25 +155,44 @@ func main() {
 		log.Printf("[warn] No accounts found. Place account JSON files in %s/ to enable API and proxy.", accountsDir)
 	}
 
-	// Startup refresh: check quota + fetch models for all accounts in the
-	// background. The HTTP listener must come up immediately — large
-	// account pools can take minutes to refresh, and we have a per-request
-	// live quota check that disables exhausted accounts before they can
-	// serve traffic, plus the refresh worker itself marks accounts as
-	// exhausted via applyQuotaInfo as soon as a check completes.
+	// Startup refresh: kick off a quota+models check in the background so
+	// the HTTP listener can come up immediately even with large pools.
 	if pool.Count() > 0 {
 		log.Printf("[startup] kicking off background quota refresh for %d account(s)", pool.Count())
 		go pool.RefreshAll(accountsDir)
 	}
 
-	// Background refresh loop
 	pool.StartRefreshLoop(cfg.RefreshInterval(), accountsDir)
 
-	// CORS middleware
+	// Token usage statistics — persisted next to the account JSONs so they
+	// share a backup target with .register_history.json.
+	statsPath := filepath.Join(accountsDir, ".token_stats.json")
+	usageStats := proxy.InitUsageStats(statsPath)
+	usageStats.StartFlushLoop(5 * time.Second)
+
+	// Async batch-register store + provider registry.
+	regStore, err := regjob.NewStore(cfg.Register.HistoryFile, cfg.Register.HistoryMemoryCap)
+	if err != nil {
+		log.Fatalf("[regjob] init store at %s: %v", cfg.Register.HistoryFile, err)
+	}
+	registry := providers.NewRegistry()
+	registry.Register(microsoft.New())
+
+	apiKey := cfg.Server.ApiKey
+	dashAuth := proxy.NewDashboardAuth(cfg.Server.AdminPassword, apiKey)
+
+	regDeps := &proxy.RegisterJobsDeps{
+		Pool:        pool,
+		AccountsDir: accountsDir,
+		Store:       regStore,
+		Providers:   registry,
+		Auth:        dashAuth,
+	}
+
 	cors := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, X-Web-Search, X-Workspace-Search")
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
@@ -170,10 +202,7 @@ func main() {
 		})
 	}
 
-	apiKey := cfg.Server.ApiKey
-	// Dashboard auth (admin password from config.yaml)
-	dashAuth := proxy.NewDashboardAuth(cfg.Server.AdminPassword, apiKey)
-	mux := newMux(pool, accountsDir, apiKey, dashAuth)
+	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps)
 
 	log.Printf("=== notion-manager ===")
 	log.Printf("Listening on :%s", port)
@@ -181,18 +210,22 @@ func main() {
 	log.Printf("API Key: %s", apiKey)
 	log.Printf("Dashboard: password protected")
 	log.Printf("Endpoints:")
-	log.Printf("  GET  /dashboard/    (Dashboard UI)")
-	log.Printf("  GET  /proxy/start   (Open proxy for account)")
-	log.Printf("  POST /v1/messages           (Anthropic Messages API)")
-	log.Printf("  POST /v1/chat/completions   (OpenAI Chat Completions API)")
-	log.Printf("  POST /v1/responses          (OpenAI Responses API)")
-	log.Printf("  GET  /v1/models             (OpenAI models API)")
-	log.Printf("  GET  /models                (OpenAI models alias)")
+	log.Printf("  GET  /dashboard/                  (Dashboard UI)")
+	log.Printf("  GET  /proxy/start                 (Open proxy for account)")
+	log.Printf("  POST /v1/messages                 (Anthropic Messages API)")
+	log.Printf("  POST /v1/chat/completions         (OpenAI Chat Completions API)")
+	log.Printf("  POST /v1/responses                (OpenAI Responses API)")
+	log.Printf("  GET  /v1/models                   (OpenAI models API)")
+	log.Printf("  GET  /models                      (OpenAI models alias)")
 	log.Printf("  GET  /health")
 	log.Printf("  GET  /admin/accounts")
 	log.Printf("  GET  /admin/models")
-	log.Printf("  GET  /admin/settings  (search settings)")
-	log.Printf("  GET  /ai            (Reverse Proxy → notion.so)")
+	log.Printf("  GET  /admin/settings              (search/proxy/ASK settings)")
+	log.Printf("  GET  /admin/stats                 (token usage stats)")
+	log.Printf("  POST /admin/register              (bulk MS-SSO register, sync)")
+	log.Printf("  POST /admin/register/start        (async job)")
+	log.Printf("  GET  /admin/register/jobs/{id}/events (SSE progress)")
+	log.Printf("  GET  /ai                          (Reverse Proxy -> notion.so)")
 
 	if err := http.ListenAndServe(":"+port, cors(apiKeyAuthMiddleware(apiKey, mux))); err != nil {
 		log.Fatalf("Server error: %v", err)

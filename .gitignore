@@ -3,13 +3,29 @@
 *.exe~
 /notion-manager
 /notion-proxy
+/notion-manager-register
+/notion2api
+/register
 
 # Secrets
 config.yaml
 token.txt
 accounts/*.json
+accounts/.register_inputs/
+accounts/.register_history.json
+accounts/.token_stats.json
 .playwright-cli/
+.playwright-mcp/
 !accounts/example.json
+
+# Bulk register / login flow debug artefacts
+_*.log
+_*.txt
+_*.json
+_*.json.*
+_hazel_cookies.json*
+consent_traffic.json
+logs/
 
 # Debug/temp
 debug_response.jsonl

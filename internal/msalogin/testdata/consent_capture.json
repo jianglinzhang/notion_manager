@@ -1,0 +1,61 @@
+{
+  "saved_at": "2026-04-27T03:32:36Z",
+  "account": "user1@hotmail.com",
+  "notes": "Capture of the POST that the Microsoft account 'Accept' button on /Consent/Update fires. Use this as the spec for pure-Go consent. Body fields come from window.ServerData of the consent page; canary == sCanary; client_id == sClientId; scope == sRawInputScopes; cscope == sRawInputGrantedScopes (empty for first-time). 302 Location chains to login.live.com/oauth20_authorize.srf?...&res=success which then 302s to www.notion.so/microsoftpopupcallback?code=...",
+  "consent_post": {
+    "url_pattern": "https://account.live.com/Consent/Update?<the-same-querystring-as-the-consent-page>",
+    "method": "POST",
+    "request_headers": {
+      "content-type": "application/x-www-form-urlencoded",
+      "origin": "https://account.live.com",
+      "referer": "<the consent page URL>",
+      "upgrade-insecure-requests": "1",
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+      "sec-ch-ua": "\"Google Chrome\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"",
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": "\"Windows\""
+    },
+    "request_body_fields": {
+      "ucaction": "Yes",
+      "client_id": "<ServerData.sClientId, e.g. 00000000495E4228>",
+      "scope": "<ServerData.sRawInputScopes, e.g. 00000000495E4228:User.Read 00000000495E4228:int.offline_access (space sep, urlencode space as +)>",
+      "cscope": "<ServerData.sRawInputGrantedScopes, empty for first-time consent>",
+      "canary": "<ServerData.sCanary>"
+    },
+    "raw_post_data": "ucaction=Yes&client_id=00000000495E4228&scope=00000000495E4228%3AUser.Read+00000000495E4228%3Aint.offline_access&cscope=&canary=X2wOl9M8cVfg5ZH%2FURhoCSNt6Ix%2BINt377g3xrzCpzE%3D5%3BDBB7U%2Bo1TLRxiKTz%2B%2F5WcKtSCq5KeocHbgtvntdDEZY%3D5",
+    "response_status": 302,
+    "response_location": "https://login.live.com/oauth20_authorize.srf?route=C528_SN1&uaid=<uaid>&client_id=<oauth-client-id>&opid=<opid>&mkt=ZH-CN&opidt=<opidt>&res=success"
+  },
+  "follow_up_oauth_redirect": {
+    "url_pattern": "https://login.live.com/oauth20_authorize.srf?...&res=success",
+    "method": "GET",
+    "response_status": 302,
+    "response_location_pattern": "https://www.notion.so/microsoftpopupcallback?code=M.<token>",
+    "set_cookies_we_need_to_persist": [
+      "MSPRequ (login.live.com)",
+      "__Host-MSAAUTH (login.live.com, Path=/)",
+      "__Host-MSAAUTHP (login.live.com, Path=/)",
+      "PPLState (.live.com)",
+      "MSPCID (login.live.com)",
+      "WLSSC (.live.com) — primary auth ticket",
+      "SDIDC (login.live.com)",
+      "OParams (login.live.com)",
+      "ANON, NAP (.live.com)"
+    ]
+  },
+  "server_data_fields_observed": {
+    "sClientId": "00000000495E4228",
+    "sRawInputScopes": "00000000495E4228:User.Read 00000000495E4228:int.offline_access",
+    "sRawInputGrantedScopes": "",
+    "sCanary": "X2wOl9M8cVfg5ZH/URhoCSNt6Ix+INt377g3xrzCpzE=5;DBB7U+o1TLRxiKTz+/5WcKtSCq5KeocHbgtvntdDEZY=5",
+    "sUnauthSessionID": "dbec2b894a9d48869a940c97d7ae7891",
+    "sSiteId": "293577",
+    "sPUID": "1688851726374344",
+    "sPageId": "Account_UpdateConsentPage_Client",
+    "hpgid": 200127,
+    "iScenarioId": 100128,
+    "sMkt": "zh-CN",
+    "iUiFlavor": 1001,
+    "sRingId": "R1"
+  }
+}

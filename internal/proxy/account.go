@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,17 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+// quotaFetcher / modelsFetcher / workspaceProbe are package-level seams
+// so unit tests can substitute deterministic stubs without spinning up a
+// fake Notion server (the real code path uses a TLS-fingerprinted
+// transport pinned to www.notion.so, which can't be repointed at httptest
+// URLs).
+var (
+	quotaFetcher   = CheckQuota
+	modelsFetcher  = FetchModels
+	workspaceProbe = CheckUserWorkspace
 )
 
 type AccountPool struct {
@@ -182,6 +194,11 @@ func (p *AccountPool) LoadFromDir(dir string) error {
 		}
 		// Load persisted quota info (snake_case keys) into runtime QuotaInfo
 		acc.QuotaInfo = loadPersistedQuotaInfo(data)
+		// Load persisted workspace probe (`space_count` /
+		// `workspace_checked_at`) so a server restart doesn't have to
+		// re-probe every account before the pool can refuse known-bad
+		// ones.
+		loadPersistedWorkspace(data, &acc)
 		p.accounts = append(p.accounts, &acc)
 		log.Printf("[account] loaded: %s (%s) [%s]", acc.UserName, acc.UserEmail, acc.PlanType)
 	}
@@ -191,6 +208,65 @@ func (p *AccountPool) LoadFromDir(dir string) error {
 	}
 	log.Printf("[account] total: %d accounts loaded", len(p.accounts))
 	return nil
+}
+
+// ReloadFromDir scans the accounts directory and adds any account whose
+// user_id is not already present in the pool. Existing entries (and their
+// runtime quota state) are preserved. This is invoked after bulk
+// registration so newly-created files become live without a server
+// restart.
+func (p *AccountPool) ReloadFromDir(dir string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	known := make(map[string]bool, len(p.accounts))
+	for _, acc := range p.accounts {
+		if acc.UserID != "" {
+			known[acc.UserID] = true
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("[account] reload %s: %v", dir, err)
+		return
+	}
+	added := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var acc Account
+		if err := json.Unmarshal(data, &acc); err != nil {
+			continue
+		}
+		if acc.TokenV2 == "" || acc.UserID == "" || acc.SpaceID == "" {
+			continue
+		}
+		if known[acc.UserID] {
+			continue
+		}
+		if acc.BrowserID == "" {
+			acc.BrowserID = generateUUIDv4()
+		}
+		if acc.ClientVersion == "" || acc.ClientVersion == "unknown" {
+			acc.ClientVersion = DefaultClientVersion
+		}
+		acc.QuotaInfo = loadPersistedQuotaInfo(data)
+		loadPersistedWorkspace(data, &acc)
+		p.accounts = append(p.accounts, &acc)
+		known[acc.UserID] = true
+		added++
+		log.Printf("[account] reload added: %s (%s)", acc.UserName, acc.UserEmail)
+	}
+	if added > 0 {
+		log.Printf("[account] reload: %d new account(s); pool now has %d", added, len(p.accounts))
+	}
 }
 
 func (p *AccountPool) LoadSingle(tokenFile string) error {
@@ -246,7 +322,7 @@ func (p *AccountPool) NextForResearch() *Account {
 	bestUsage := int(^uint(0) >> 1)
 	for i := 0; i < n; i++ {
 		acc := p.accounts[(start+uint64(i))%uint64(n)]
-		if p.isQuotaExhausted(acc) {
+		if p.isUnusable(acc) {
 			continue
 		}
 		quota := acc.quotaInfoSnapshot()
@@ -294,7 +370,7 @@ func (p *AccountPool) pickNextRoundRobin(exclude map[*Account]bool) *Account {
 		if exclude != nil && exclude[acc] {
 			continue
 		}
-		if p.isQuotaExhausted(acc) {
+		if p.isUnusable(acc) {
 			continue
 		}
 		return acc
@@ -329,7 +405,7 @@ func (p *AccountPool) pickBestAccountLocked(exclude map[*Account]bool) *Account 
 		if exclude != nil && exclude[acc] {
 			continue
 		}
-		if p.isQuotaExhausted(acc) {
+		if p.isUnusable(acc) {
 			continue
 		}
 		score := accountQuotaPriority(acc)
@@ -396,6 +472,36 @@ func (p *AccountPool) isQuotaExhausted(acc *Account) bool {
 		return false
 	}
 	return true
+}
+
+// hasNoWorkspace returns true only after a probe has confirmed the
+// account has zero accessible workspaces. Unprobed accounts (fresh
+// registrations, accounts loaded before the probe ever ran) are treated
+// as unknown / usable so the pool can still serve traffic on the first
+// boot and the next refresh tick promotes/demotes them.
+func (p *AccountPool) hasNoWorkspace(acc *Account) bool {
+	return acc != nil && acc.WorkspaceCheckedAt != nil && acc.SpaceCount == 0
+}
+
+// isUnusable folds quota-exhausted and no-workspace accounts into a
+// single "do not select" predicate used by every picker.
+func (p *AccountPool) isUnusable(acc *Account) bool {
+	return p.isQuotaExhausted(acc) || p.hasNoWorkspace(acc)
+}
+
+// applyWorkspaceCount records the latest probe result. Caller must NOT
+// hold p.mu. Returns the previous SpaceCount and whether the snapshot
+// changed so callers can decide to log only on transitions.
+func (p *AccountPool) applyWorkspaceCount(acc *Account, count int) (prev int, changed bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	prev = acc.SpaceCount
+	hadCheck := acc.WorkspaceCheckedAt != nil
+	now := time.Now()
+	acc.SpaceCount = count
+	acc.WorkspaceCheckedAt = &now
+	changed = !hadCheck || prev != count
+	return prev, changed
 }
 
 // MarkPermanentlyExhausted marks a free-plan account as permanently exhausted (never recovers).
@@ -492,7 +598,7 @@ func (p *AccountPool) RefreshAccountQuota(acc *Account, minInterval time.Duratio
 		p.liveQuotaMu.Unlock()
 	}()
 
-	info, err := CheckQuota(acc)
+	info, err := quotaFetcher(acc)
 	if err != nil {
 		log.Printf("[quota-live] %s check failed: %v (using cached state)", acc.UserEmail, err)
 		// On error, trust the cached snapshot — return current eligibility.
@@ -542,7 +648,7 @@ func (p *AccountPool) RefreshAccountQuotaAsync(acc *Account) {
 			delete(p.liveQuotaInflight, acc)
 			p.liveQuotaMu.Unlock()
 		}()
-		info, err := CheckQuota(acc)
+		info, err := quotaFetcher(acc)
 		if err != nil {
 			log.Printf("[quota-live-async] %s check failed: %v", acc.UserEmail, err)
 			return
@@ -616,13 +722,30 @@ func (p *AccountPool) RemoveAccount(acc *Account) {
 	}
 }
 
-// AvailableCount returns the number of accounts not currently quota-exhausted
+// RemoveAccountByEmail drops the in-memory pool entry whose user_email
+// matches (case-insensitive). Does NOT touch disk; callers are responsible
+// for the file lifecycle (used by the dashboard delete endpoint).
+func (p *AccountPool) RemoveAccountByEmail(email string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, a := range p.accounts {
+		if strings.EqualFold(a.UserEmail, email) {
+			p.accounts = append(p.accounts[:i], p.accounts[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// AvailableCount returns the number of accounts the pool can currently
+// route traffic to (i.e. quota is healthy AND the workspace probe didn't
+// flag the account as having zero accessible workspaces).
 func (p *AccountPool) AvailableCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	count := 0
 	for _, acc := range p.accounts {
-		if !p.isQuotaExhausted(acc) {
+		if !p.isUnusable(acc) {
 			count++
 		}
 	}
@@ -635,16 +758,26 @@ func (p *AccountPool) Count() int {
 	return len(p.accounts)
 }
 
-// GetByEmail returns an available (non-exhausted) account by email, or nil if not found/exhausted.
+// GetByEmail returns an available (non-exhausted, has workspace) account
+// by email, or nil if not found / exhausted / has no workspace.
 func (p *AccountPool) GetByEmail(email string) *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, acc := range p.accounts {
-		if acc.UserEmail == email && !p.isQuotaExhausted(acc) {
+		if acc.UserEmail == email && !p.isUnusable(acc) {
 			return acc
 		}
 	}
 	return nil
+}
+
+// HasNoWorkspace returns true when the account has been probed and found
+// to have zero accessible workspaces. Used by handlers that need to
+// distinguish "no such account" from "account exists but is broken".
+func (p *AccountPool) HasNoWorkspace(acc *Account) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.hasNoWorkspace(acc)
 }
 
 func (p *AccountPool) AllModels() []ModelEntry {
@@ -741,6 +874,7 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 		disabledNow       atomic.Int64
 		recoveredNow      atomic.Int64
 		failedChecks      atomic.Int64
+		workspaceLost     atomic.Int64
 	)
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, concurrency)
@@ -769,7 +903,7 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 			// 1. Check quota — applyQuotaInfo handles state transitions and
 			// ensures every write happens under p.mu so concurrent selectors
 			// always observe a consistent view.
-			info, err := CheckQuota(acc)
+			info, err := quotaFetcher(acc)
 			if err != nil {
 				log.Printf("[refresh] %s (%s): quota check failed: %v", acc.UserName, acc.UserEmail, err)
 				failedChecks.Add(1)
@@ -806,13 +940,31 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 			p.refreshMu.Unlock()
 
 			// 2. Fetch models
-			models, err := FetchModels(acc)
+			models, err := modelsFetcher(acc)
 			if err != nil {
 				log.Printf("[refresh] %s (%s): model fetch failed: %v", acc.UserName, acc.UserEmail, err)
 			} else if len(models) > 0 {
 				acc.setModels(models)
 				modelsUpdatedFlag.Store(true)
 				log.Printf("[refresh] %s (%s): fetched %d models", acc.UserName, acc.UserEmail, len(models))
+			}
+
+			// 3. Probe workspace. An account whose user_root has zero
+			// space_views is the silent failure mode that makes /ai
+			// hang forever — exclude these from selection so the user
+			// never opens a dead account from the dashboard.
+			count, err := workspaceProbe(acc)
+			if err != nil {
+				log.Printf("[refresh] %s (%s): workspace probe failed: %v", acc.UserName, acc.UserEmail, err)
+			} else {
+				prev, changed := p.applyWorkspaceCount(acc, count)
+				switch {
+				case count == 0 && (changed || prev == 0):
+					log.Printf("[refresh] %s (%s): NO WORKSPACE — excluded from pool (loadUserContent.user_root.space_views is empty)", acc.UserName, acc.UserEmail)
+					workspaceLost.Add(1)
+				case count > 0 && changed:
+					log.Printf("[refresh] %s (%s): %d workspace(s) accessible", acc.UserName, acc.UserEmail, count)
+				}
 			}
 		}(acc, quota)
 	}
@@ -840,8 +992,8 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 	}
 
 	available := p.AvailableCount()
-	log.Printf("[refresh] complete: %d/%d available, disabled=%d, recovered=%d, check_errors=%d",
-		available, len(accs), disabledNow.Load(), recoveredNow.Load(), failedChecks.Load())
+	log.Printf("[refresh] complete: %d/%d available, disabled=%d, recovered=%d, no_workspace=%d, check_errors=%d",
+		available, len(accs), disabledNow.Load(), recoveredNow.Load(), workspaceLost.Load(), failedChecks.Load())
 }
 
 // normalizeModelName converts display name like "GPT-5.2" to a user-friendly alias like "gpt-5.2"
@@ -913,6 +1065,14 @@ func (p *AccountPool) SaveAccounts(dir string) {
 				existing["quota_checked_at"] = quota.CheckedAt.Format(time.RFC3339)
 			}
 
+			// Workspace probe — only persist when we have a real
+			// observation (WorkspaceCheckedAt set) so a never-probed
+			// account doesn't accidentally get pinned at space_count=0.
+			if acc.WorkspaceCheckedAt != nil {
+				existing["space_count"] = acc.SpaceCount
+				existing["workspace_checked_at"] = acc.WorkspaceCheckedAt.Format(time.RFC3339)
+			}
+
 			// Write back
 			out, err := json.MarshalIndent(existing, "", "  ")
 			if err != nil {
@@ -922,6 +1082,176 @@ func (p *AccountPool) SaveAccounts(dir string) {
 			break
 		}
 	}
+}
+
+// saveAccountFile rewrites a single account's JSON file so it carries the
+// freshest quota_info / quota_checked_at / available_models, while
+// preserving every other field (token, ids, browser/device, registered_via).
+//
+// The write is atomic (tmp + os.Rename) so a crash mid-save can't leave
+// LoadFromDir staring at a half-written JSON. Callers should hold no
+// AccountPool lock — we read acc fields directly so concurrent updates by
+// applyQuotaInfo are protected by Go's safe-map / pointer guarantees on
+// the small primitives we copy.
+//
+// Returns an error if no on-disk file matches acc.UserEmail; that is a
+// real-world signal someone deleted the account file out from under us.
+func saveAccountFile(dir string, acc *Account) error {
+	if acc == nil {
+		return fmt.Errorf("saveAccountFile: nil account")
+	}
+	if dir == "" {
+		return fmt.Errorf("saveAccountFile: empty dir")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read dir: %w", err)
+	}
+	var matchPath string
+	var existing map[string]interface{}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			continue
+		}
+		email, _ := raw["user_email"].(string)
+		if !strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(acc.UserEmail)) {
+			continue
+		}
+		matchPath = path
+		existing = raw
+		break
+	}
+	if matchPath == "" {
+		return fmt.Errorf("no account file matches %s", acc.UserEmail)
+	}
+
+	if len(acc.Models) > 0 {
+		modelEntries := make([]map[string]string, 0, len(acc.Models))
+		for _, m := range acc.Models {
+			modelEntries = append(modelEntries, map[string]string{"id": m.ID, "name": m.Name})
+		}
+		existing["available_models"] = modelEntries
+	}
+	if acc.QuotaInfo != nil {
+		existing["quota_info"] = map[string]interface{}{
+			"is_eligible":         acc.QuotaInfo.IsEligible,
+			"space_usage":         acc.QuotaInfo.SpaceUsage,
+			"space_limit":         acc.QuotaInfo.SpaceLimit,
+			"user_usage":          acc.QuotaInfo.UserUsage,
+			"user_limit":          acc.QuotaInfo.UserLimit,
+			"last_usage_at":       acc.QuotaInfo.LastUsageAtMs,
+			"research_mode_usage": acc.QuotaInfo.ResearchModeUsage,
+			"has_premium":         acc.QuotaInfo.HasPremium,
+			"premium_balance":     acc.QuotaInfo.PremiumBalance,
+			"premium_usage":       acc.QuotaInfo.PremiumUsage,
+			"premium_limit":       acc.QuotaInfo.PremiumLimit,
+		}
+	}
+	if acc.QuotaCheckedAt != nil {
+		existing["quota_checked_at"] = acc.QuotaCheckedAt.Format(time.RFC3339)
+	}
+	if acc.WorkspaceCheckedAt != nil {
+		existing["space_count"] = acc.SpaceCount
+		existing["workspace_checked_at"] = acc.WorkspaceCheckedAt.Format(time.RFC3339)
+	}
+
+	out, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	out = append(out, '\n')
+	tmp := matchPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return fmt.Errorf("write tmp: %w", err)
+	}
+	if err := os.Rename(tmp, matchPath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
+}
+
+// RefreshAndPersistAccount runs a live quota + models check for a single
+// account and persists the result to disk. Designed for one-off refreshes
+// (e.g. immediately after a successful registration) so the dashboard
+// sees real numbers without waiting for the next global refresh tick.
+//
+// Errors:
+//   - email is unknown to the pool (no Account loaded yet)
+//   - quota fetch failed (we don't persist nothing)
+//   - ctx was already cancelled
+//
+// A models-fetch failure is logged but not returned, since quota is the
+// higher-value half of the snapshot.
+func (p *AccountPool) RefreshAndPersistAccount(ctx context.Context, accountsDir, email string) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	target := strings.ToLower(strings.TrimSpace(email))
+	if target == "" {
+		return fmt.Errorf("RefreshAndPersistAccount: empty email")
+	}
+
+	p.mu.RLock()
+	var acc *Account
+	for _, a := range p.accounts {
+		if strings.EqualFold(strings.TrimSpace(a.UserEmail), target) {
+			acc = a
+			break
+		}
+	}
+	p.mu.RUnlock()
+	if acc == nil {
+		return fmt.Errorf("account not in pool: %s", email)
+	}
+
+	info, err := quotaFetcher(acc)
+	if err != nil {
+		return fmt.Errorf("quota check: %w", err)
+	}
+	p.applyQuotaInfo(acc, info)
+
+	models, mErr := modelsFetcher(acc)
+	if mErr != nil {
+		log.Printf("[post-register] %s: models fetch failed: %v (persisting quota only)", acc.UserEmail, mErr)
+	} else if len(models) > 0 {
+		p.mu.Lock()
+		acc.Models = models
+		p.mu.Unlock()
+	}
+
+	// Workspace probe is best-effort. If it fails we still persist the
+	// quota so the dashboard sees real numbers; the next /admin/refresh
+	// retry will re-probe.
+	if count, wErr := workspaceProbe(acc); wErr != nil {
+		log.Printf("[post-register] %s: workspace probe failed: %v", acc.UserEmail, wErr)
+	} else {
+		p.applyWorkspaceCount(acc, count)
+		if count == 0 {
+			log.Printf("[post-register] %s: NO WORKSPACE detected immediately after registration — account will be excluded from the pool", acc.UserEmail)
+		}
+	}
+
+	if accountsDir == "" {
+		return nil
+	}
+	if err := saveAccountFile(accountsDir, acc); err != nil {
+		return fmt.Errorf("persist: %w", err)
+	}
+	log.Printf("[post-register] %s: quota refreshed and persisted (eligible=%v, space %d/%d, workspaces=%d)",
+		acc.UserEmail, info.IsEligible, info.SpaceUsage, info.SpaceLimit, acc.SpaceCount)
+	return nil
 }
 
 // StartRefreshLoop runs a background goroutine that periodically refreshes all accounts
@@ -944,12 +1274,24 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 		quota := acc.quotaSnapshot()
 		models := acc.modelsSnapshot()
 		entry := map[string]interface{}{
-			"email":     acc.UserEmail,
-			"name":      acc.UserName,
-			"plan":      acc.PlanType,
-			"space":     acc.SpaceName,
-			"exhausted": p.isQuotaExhausted(acc),
-			"permanent": quota.PermanentlyExhausted,
+			"email":        acc.UserEmail,
+			"name":         acc.UserName,
+			"plan":         acc.PlanType,
+			"space":        acc.SpaceName,
+			"exhausted":    p.isQuotaExhausted(acc),
+			"permanent":    quota.PermanentlyExhausted,
+			"no_workspace": p.hasNoWorkspace(acc),
+			// token_v2 is exposed only behind dashboard auth (the caller of
+			// HandleAdminAccounts already gates on session). The dashboard
+			// shows a "copy token" action and uses it for nothing else.
+			"token_v2": acc.TokenV2,
+		}
+		if acc.WorkspaceCheckedAt != nil {
+			entry["space_count"] = acc.SpaceCount
+			entry["workspace_checked_at"] = acc.WorkspaceCheckedAt.Format(time.RFC3339)
+		}
+		if acc.RegisteredVia != "" {
+			entry["registered_via"] = acc.RegisteredVia
 		}
 		if quota.Info != nil {
 			entry["eligible"] = quota.Info.IsEligible
@@ -996,11 +1338,16 @@ func (p *AccountPool) GetQuotaSummary() []map[string]interface{} {
 	for _, acc := range p.accounts {
 		quota := acc.quotaSnapshot()
 		entry := map[string]interface{}{
-			"email":     acc.UserEmail,
-			"name":      acc.UserName,
-			"plan":      acc.PlanType,
-			"exhausted": p.isQuotaExhausted(acc),
-			"permanent": quota.PermanentlyExhausted,
+			"email":        acc.UserEmail,
+			"name":         acc.UserName,
+			"plan":         acc.PlanType,
+			"exhausted":    p.isQuotaExhausted(acc),
+			"permanent":    quota.PermanentlyExhausted,
+			"no_workspace": p.hasNoWorkspace(acc),
+		}
+		if acc.WorkspaceCheckedAt != nil {
+			entry["space_count"] = acc.SpaceCount
+			entry["workspace_checked_at"] = acc.WorkspaceCheckedAt.Format(time.RFC3339)
 		}
 		if quota.Info != nil {
 			entry["eligible"] = quota.Info.IsEligible
@@ -1028,6 +1375,30 @@ func (p *AccountPool) GetQuotaSummary() []map[string]interface{} {
 		summary = append(summary, entry)
 	}
 	return summary
+}
+
+// loadPersistedWorkspace fills acc.SpaceCount / acc.WorkspaceCheckedAt
+// from the persisted JSON. Absent fields leave the runtime values
+// untouched (so the next probe still treats the account as unknown).
+func loadPersistedWorkspace(data []byte, acc *Account) {
+	var raw struct {
+		SpaceCount         *int    `json:"space_count"`
+		WorkspaceCheckedAt *string `json:"workspace_checked_at"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return
+	}
+	if raw.WorkspaceCheckedAt == nil || *raw.WorkspaceCheckedAt == "" {
+		return
+	}
+	t, err := time.Parse(time.RFC3339, *raw.WorkspaceCheckedAt)
+	if err != nil {
+		return
+	}
+	acc.WorkspaceCheckedAt = &t
+	if raw.SpaceCount != nil {
+		acc.SpaceCount = *raw.SpaceCount
+	}
 }
 
 // loadPersistedQuotaInfo parses the persisted quota_info (snake_case keys) from raw account JSON.

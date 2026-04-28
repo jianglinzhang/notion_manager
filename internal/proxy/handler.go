@@ -6,9 +6,21 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"notion-manager/internal/netutil"
+)
+
+// Default and maximum page sizes for /admin/accounts pagination.
+// Default is small to keep dashboard payloads quick; the cap prevents
+// callers from accidentally requesting the whole pool through the
+// paginated path.
+const (
+	defaultAccountsPageSize = 50
+	maxAccountsPageSize     = 500
 )
 
 const publicModelCreatedAt = int64(1735689600)
@@ -108,7 +120,21 @@ func friendlyModelNameByInternalID(id string) string {
 	return candidates[0]
 }
 
-// HandleAdminAccounts returns detailed account info including models, quota, and status
+// HandleAdminAccounts returns detailed account info including models, quota, and status.
+//
+// Query parameters (all optional, dashboard-friendly):
+//   - q          : case-insensitive substring filter on email/name/plan/space.
+//   - page       : 0-based page index. Defaults to 0.
+//   - page_size  : max entries to return; clamped to [1, maxAccountsPageSize].
+//
+// When ANY of those parameters are present we apply the same sort the
+// dashboard previously did client-side, filter, then slice — and add
+// `page`, `page_size`, `filtered_total` fields to the response. Without
+// them the response keeps its historical shape (the full unsorted list)
+// so older scripts and integrations remain happy. The pool-wide
+// `summary` block is added unconditionally because it's purely additive
+// and lets the dashboard render headline cards without iterating the
+// full account list.
 func HandleAdminAccounts(pool *AccountPool, auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -116,14 +142,68 @@ func HandleAdminAccounts(pool *AccountPool, auth *DashboardAuth) http.HandlerFun
 			http.Error(w, `{"error":"unauthorized, dashboard login required"}`, http.StatusUnauthorized)
 			return
 		}
+
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		pageStr := r.URL.Query().Get("page")
+		sizeStr := r.URL.Query().Get("page_size")
+		paginated := pageStr != "" || sizeStr != "" || q != ""
+
+		all := pool.GetAccountDetails()
 		resp := map[string]interface{}{
 			"total":     pool.Count(),
 			"available": pool.AvailableCount(),
 			"models":    pool.AllModels(),
-			"accounts":  pool.GetAccountDetails(),
 			"refresh":   pool.GetRefreshStatus(),
+			"summary":   summarizeAccounts(all),
 		}
+
+		if !paginated {
+			// Backward-compatible path: hand back the full unsorted
+			// list so existing scripts/integrations keep working.
+			resp["accounts"] = all
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		filtered := filterAccountDetails(all, q)
+		sortAccountDetails(filtered)
+
+		page, _ := strconv.Atoi(pageStr)
+		if page < 0 {
+			page = 0
+		}
+		size, _ := strconv.Atoi(sizeStr)
+		if size <= 0 {
+			size = defaultAccountsPageSize
+		}
+		if size > maxAccountsPageSize {
+			size = maxAccountsPageSize
+		}
+
+		resp["accounts"] = paginateAccounts(filtered, page, size)
+		resp["page"] = page
+		resp["page_size"] = size
+		resp["filtered_total"] = len(filtered)
 		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// HandleAdminStats returns aggregated Token usage statistics for the
+// dashboard. It only requires a valid dashboard session — same auth
+// surface as /admin/accounts. The response shape is documented on
+// UsageSnapshot.
+func HandleAdminStats(stats *UsageStats, auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if auth.HasAdminPassword() && !auth.ValidateSession(r) {
+			http.Error(w, `{"error":"unauthorized, dashboard login required"}`, http.StatusUnauthorized)
+			return
+		}
+		if stats == nil {
+			stats = GlobalUsageStats()
+		}
+		snap := stats.Snapshot(5)
+		json.NewEncoder(w).Encode(snap)
 	}
 }
 
@@ -186,15 +266,19 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"enable_web_search":       AppConfig.WebSearchEnabled(),
 				"enable_workspace_search": AppConfig.WorkspaceSearchEnabled(),
+				"ask_mode_default":        AppConfig.AskModeDefault(),
 				"disable_notion_prompt":   AppConfig.Proxy.DisableNotionPrompt,
 				"debug_logging":           AppConfig.Server.DebugLogging,
+				"notion_proxy":            AppConfig.NotionProxyURL(),
 			})
 
 		case "PUT":
 			var body struct {
-				EnableWebSearch       *bool `json:"enable_web_search"`
-				EnableWorkspaceSearch *bool `json:"enable_workspace_search"`
-				DebugLogging          *bool `json:"debug_logging"`
+				EnableWebSearch       *bool   `json:"enable_web_search"`
+				EnableWorkspaceSearch *bool   `json:"enable_workspace_search"`
+				AskModeDefault        *bool   `json:"ask_mode_default"`
+				DebugLogging          *bool   `json:"debug_logging"`
+				NotionProxy           *string `json:"notion_proxy"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -202,6 +286,7 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 			}
 
 			changed := false
+			rebuildTransport := false
 			if body.EnableWebSearch != nil {
 				AppConfig.Proxy.EnableWebSearch = body.EnableWebSearch
 				changed = true
@@ -212,11 +297,38 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				changed = true
 				log.Printf("[settings] enable_workspace_search → %v", *body.EnableWorkspaceSearch)
 			}
+			if body.AskModeDefault != nil {
+				AppConfig.Proxy.AskModeDefault = body.AskModeDefault
+				changed = true
+				log.Printf("[settings] ask_mode_default → %v", *body.AskModeDefault)
+			}
 			if body.DebugLogging != nil {
 				AppConfig.Server.DebugLogging = *body.DebugLogging
 				SetDebugLoggingEnabled(*body.DebugLogging)
 				changed = true
 				log.Printf("[settings] debug_logging → %v", *body.DebugLogging)
+			}
+			if body.NotionProxy != nil {
+				next := strings.TrimSpace(*body.NotionProxy)
+				if next != "" {
+					if err := netutil.ValidateProxyURL(next); err != nil {
+						// Surface scheme/format errors immediately so the
+						// dashboard can roll back the input field instead
+						// of waiting for the next dial to fail.
+						http.Error(w, `{"error":"unsupported proxy scheme (want http/https/socks5)"}`, http.StatusBadRequest)
+						return
+					}
+				}
+				if AppConfig.Proxy.NotionProxy != next {
+					AppConfig.Proxy.NotionProxy = next
+					changed = true
+					rebuildTransport = true
+					if next == "" {
+						log.Printf("[settings] notion_proxy cleared (direct dial)")
+					} else {
+						log.Printf("[settings] notion_proxy → %s", next)
+					}
+				}
 			}
 
 			// Persist to config.yaml
@@ -224,11 +336,20 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				persistSearchSettings(configPath)
 			}
 
+			// Drop idle pooled connections so the next notion dial picks
+			// up the new upstream proxy. Active in-flight requests
+			// continue on their existing connection until completion.
+			if rebuildTransport {
+				RebuildChromeTransport()
+			}
+
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"enable_web_search":       AppConfig.WebSearchEnabled(),
 				"enable_workspace_search": AppConfig.WorkspaceSearchEnabled(),
+				"ask_mode_default":        AppConfig.AskModeDefault(),
 				"disable_notion_prompt":   AppConfig.Proxy.DisableNotionPrompt,
 				"debug_logging":           AppConfig.Server.DebugLogging,
+				"notion_proxy":            AppConfig.NotionProxyURL(),
 			})
 
 		default:
@@ -255,6 +376,8 @@ func persistSearchSettings(configPath string) {
 		proxyNode := getOrCreateYAMLMapping(mapping, "proxy")
 		setYAMLBool(proxyNode, "enable_web_search", AppConfig.WebSearchEnabled())
 		setYAMLBool(proxyNode, "enable_workspace_search", AppConfig.WorkspaceSearchEnabled())
+		setYAMLBool(proxyNode, "ask_mode_default", AppConfig.AskModeDefault())
+		setYAMLString(proxyNode, "notion_proxy", AppConfig.Proxy.NotionProxy)
 
 		serverNode := getOrCreateYAMLMapping(mapping, "server")
 		setYAMLBool(serverNode, "debug_logging", AppConfig.Server.DebugLogging)
@@ -308,6 +431,30 @@ func setYAMLBool(mapping *yaml.Node, key string, value bool) {
 	mapping.Content = append(mapping.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
 		&yaml.Node{Kind: yaml.ScalarNode, Value: valStr, Tag: "!!bool"},
+	)
+}
+
+// setYAMLString sets or creates a string field in a YAML mapping node.
+// Empty values are still written explicitly so the dashboard's "clear
+// proxy" action persists across restarts (otherwise YAML would treat a
+// missing key as "use default", which here is also "" — equivalent in
+// practice but unfriendly for diffs/audits).
+func setYAMLString(mapping *yaml.Node, key, value string) {
+	style := yaml.Style(0)
+	if value == "" {
+		style = yaml.DoubleQuotedStyle
+	}
+	for i := 0; i < len(mapping.Content)-1; i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1].Value = value
+			mapping.Content[i+1].Tag = "!!str"
+			mapping.Content[i+1].Style = style
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Value: value, Tag: "!!str", Style: style},
 	)
 }
 

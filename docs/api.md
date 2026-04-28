@@ -2,21 +2,25 @@
 
 [← Back to README](../README.md)
 
-## Supported API shapes
+`/v1/messages` accepts Anthropic Messages API payloads and is the only endpoint
+intended for external clients. All admin / dashboard surfaces live under
+`/admin/*` and `/dashboard/` and use a separate session-cookie auth model
+(see [Dashboard](dashboard.md)).
 
-- `POST /v1/messages` — Anthropic Messages API
-- `POST /v1/chat/completions` — OpenAI Chat Completions API
-- `POST /v1/responses` — OpenAI Responses API
-- `GET /v1/models` — OpenAI models API
-- `GET /models` — compatibility alias for `/v1/models`
+## Authentication
 
-All of these routes reuse the same multi-account pool, file upload pipeline, tool bridge, and failover logic.
+Send the API key the same way you would talk to Anthropic:
 
-`/v1/responses` is currently stateless, so `previous_response_id` is not supported.
+```bash
+-H "Authorization: Bearer <api_key>"
+# or
+-H "x-api-key: <api_key>"
+```
 
-## Anthropic Messages request
+The accepted key is `proxy.api_key` in `config.yaml` (env override
+`PROXY_API_KEY`).
 
-`/v1/messages` accepts Anthropic Messages API payloads.
+## Standard request
 
 ```bash
 curl http://localhost:3000/v1/messages \
@@ -33,46 +37,45 @@ curl http://localhost:3000/v1/messages \
 
 If `model` is omitted, the service falls back to `proxy.default_model`.
 
-## OpenAI Models request
+## Request headers
+
+| Header | Effect |
+| --- | --- |
+| `Authorization: Bearer <key>` / `x-api-key: <key>` | API key auth (one is required) |
+| `Content-Type: application/json` | Required |
+| `Accept: text/event-stream` | Optional; combined with `"stream": true` you get an SSE stream that mirrors Anthropic's event protocol |
+| `X-Web-Search: true|false` | Per-request override for web search (default from `proxy.enable_web_search`) |
+| `X-Workspace-Search: true|false` | Per-request override for workspace search (default from `proxy.enable_workspace_search`) |
+
+Unknown headers are ignored.
+
+## ASK mode (read-only Notion replies)
+
+Notion's frontend has an **Ask** toggle that disables page edits and tool calls,
+producing pure read-only answers. notion-manager exposes the same flag in two
+ways:
+
+1. **Global default** – `proxy.ask_mode_default: true` in `config.yaml`, or
+   toggled live from the dashboard `Settings` panel.
+2. **Per-request suffix** – append `-ask` to the model name. The suffix is
+   stripped server-side before model resolution, so any model alias works:
 
 ```bash
-curl http://localhost:3000/v1/models \
-  -H "Authorization: Bearer <api_key>"
-```
-
-The response returns normalized friendly model IDs that can be passed back into `/v1/chat/completions`, `/v1/responses`, or `/v1/messages`.
-
-`GET /models` returns the same payload for clients that probe the bare root alias.
-
-## OpenAI Chat Completions request
-
-```bash
-curl http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer <api_key>" \
+# Force ASK mode for this single request even if the global default is off
+curl http://localhost:3000/v1/messages \
+  -H "x-api-key: <api_key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.4",
+    "model": "claude-sonnet-4.6-ask",
     "messages": [
-      { "role": "user", "content": "Summarize the architecture of notion-manager." }
+      { "role": "user", "content": "Summarise this workspace without editing it." }
     ]
   }'
 ```
 
-Supported request features include `messages`, `stream`, `tools`, `tool_choice`, `response_format`, and inline file/image inputs.
-
-## OpenAI Responses request
-
-```bash
-curl http://localhost:3000/v1/responses \
-  -H "Authorization: Bearer <api_key>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-5.4",
-    "input": "List the main subsystems in this project."
-  }'
-```
-
-Supported request features include `input`, `instructions`, `stream`, `tools`, `tool_choice`, `text.format`, and inline file/image inputs.
+The matrix is `OR`-style: ASK mode is on whenever **either** the suffix or the
+global default is set. Per-request `-ask` cannot disable the global default; if
+you need a hard escape you must clear `ask_mode_default`.
 
 ## Search overrides
 
@@ -128,7 +131,15 @@ curl http://localhost:3000/v1/messages \
   }'
 ```
 
+The proxy uploads, polls processing, then injects the transcription / image
+into the conversation transparently.
+
 ## Research mode
+
+Research mode is triggered by model name:
+
+- `researcher`
+- `fast-researcher`
 
 ```bash
 curl -N http://localhost:3000/v1/messages \
@@ -145,4 +156,33 @@ curl -N http://localhost:3000/v1/messages \
   }'
 ```
 
-Research mode is single-turn, ignores file uploads, ignores custom tools, and runs with a longer timeout path.
+Research mode is single-turn, ignores file uploads, ignores `tools`, and uses
+the longer `proxy.research_timeout` (default `360s`) timeout path.
+
+## Streaming
+
+Set `"stream": true` on the body. The proxy emits the standard Anthropic SSE
+sequence (`message_start`, `content_block_*`, `message_delta`, `message_stop`)
+plus a `usage_stats` event in the final delta containing the input / output
+tokens that were recorded against the serving account.
+
+## Errors
+
+Errors follow Anthropic's shape:
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "message": "messages is required"
+  }
+}
+```
+
+Common cases:
+
+- `401 unauthorized` – missing / wrong API key
+- `400 invalid_request_error` – malformed JSON, empty `messages`, or unsupported attachment type
+- `429 rate_limit_error` – every account in the pool is currently exhausted; the response message describes which quota tripped
+- `502 bad_gateway` – upstream Notion error after retries

@@ -2,21 +2,21 @@
 
 [← 返回 README](../README_CN.md)
 
-## 支持的 API 形态
+`/v1/messages` 接收 Anthropic Messages API 请求体，是**唯一**对外的客户端入口。所有 admin/dashboard 接口都在 `/admin/*` 与 `/dashboard/` 下，使用独立的会话 cookie 鉴权（详见 [Dashboard](dashboard_cn.md)）。
 
-- `POST /v1/messages` — Anthropic Messages API
-- `POST /v1/chat/completions` — OpenAI Chat Completions API
-- `POST /v1/responses` — OpenAI Responses API
-- `GET /v1/models` — OpenAI Models API
-- `GET /models` — `/v1/models` 的兼容别名
+## 鉴权
 
-这些路由共用同一套多账号池、文件上传链路、工具桥接和失败切换逻辑。
+像调用 Anthropic 一样发送 API key：
 
-当前 `/v1/responses` 是无状态桥接，因此暂不支持 `previous_response_id`。
+```bash
+-H "Authorization: Bearer <api_key>"
+# 或
+-H "x-api-key: <api_key>"
+```
 
-## Anthropic Messages 基本请求
+服务端 key 来自 `config.yaml` 的 `proxy.api_key`（环境变量 `PROXY_API_KEY` 可覆盖）。
 
-`/v1/messages` 使用 Anthropic Messages API 结构。
+## 基本请求
 
 ```bash
 curl http://localhost:3000/v1/messages \
@@ -33,55 +33,43 @@ curl http://localhost:3000/v1/messages \
 
 如果不传 `model`，会自动使用 `proxy.default_model`。
 
-## OpenAI Models 基本请求
+## 请求头
+
+| Header | 作用 |
+| --- | --- |
+| `Authorization: Bearer <key>` / `x-api-key: <key>` | API Key 鉴权（二选一，必传） |
+| `Content-Type: application/json` | 必传 |
+| `Accept: text/event-stream` | 可选；配合 `"stream": true` 使用，返回 Anthropic 标准 SSE 流 |
+| `X-Web-Search: true|false` | 单次覆盖 Web 搜索开关（默认值来自 `proxy.enable_web_search`） |
+| `X-Workspace-Search: true|false` | 单次覆盖 Workspace 搜索开关（默认值来自 `proxy.enable_workspace_search`） |
+
+未识别的 header 会被忽略。
+
+## ASK 模式（只读对话）
+
+Notion 前端有一个 **Ask** 开关，开启后模型只能回答、不会编辑页面、也不会调用 tool。notion-manager 暴露两种触发方式：
+
+1. **全局默认**：在 `config.yaml` 中 `proxy.ask_mode_default: true`，或在 Dashboard `Settings` 面板里实时切换。
+2. **请求级后缀**：在模型名末尾追加 `-ask`，server 端在模型解析前会剥掉这个后缀，因此任何别名都能用：
 
 ```bash
-curl http://localhost:3000/v1/models \
-  -H "Authorization: Bearer <api_key>"
-```
-
-返回结果里的模型 ID 都是归一化后的友好名称，可直接继续传给 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`。
-
-`GET /models` 会返回相同 payload，兼容某些直接探测根路径的客户端。
-
-## OpenAI Chat Completions 基本请求
-
-```bash
-curl http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer <api_key>" \
+# 即便全局默认是 off，这一次也强制只读
+curl http://localhost:3000/v1/messages \
+  -H "x-api-key: <api_key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.4",
+    "model": "claude-sonnet-4.6-ask",
     "messages": [
-      { "role": "user", "content": "请总结 notion-manager 的主要架构。" }
+      { "role": "user", "content": "总结 workspace 但不要做任何修改。" }
     ]
   }'
 ```
 
-已支持的常用字段包括 `messages`、`stream`、`tools`、`tool_choice`、`response_format`，以及内联图片 / 文件输入。
-
-## OpenAI Responses 基本请求
-
-```bash
-curl http://localhost:3000/v1/responses \
-  -H "Authorization: Bearer <api_key>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-5.4",
-    "input": "列出这个项目的主要子系统。"
-  }'
-```
-
-已支持的常用字段包括 `input`、`instructions`、`stream`、`tools`、`tool_choice`、`text.format`，以及内联图片 / 文件输入。
+判定逻辑是 `OR`：只要后缀或全局默认任一为真，本次请求就走 ASK 模式。**`-ask` 不能反过来关闭全局默认**，如果想强制关闭只能取消 `ask_mode_default`。
 
 ## 搜索控制
 
-全局开关由 `config.yaml` 和 Dashboard 管理，请求级覆盖使用这两个请求头：
-
-- `X-Web-Search: true|false`
-- `X-Workspace-Search: true|false`
-
-示例：
+全局开关由 `config.yaml` 与 Dashboard 管理，单次覆盖使用上面表格中的两个 header。示例：
 
 ```bash
 curl http://localhost:3000/v1/messages \
@@ -168,4 +156,29 @@ curl -N http://localhost:3000/v1/messages \
 - 只使用最后一条用户消息，属于单轮研究
 - 会忽略文件上传
 - 会忽略 `tools`
-- 超时比普通对话更长，默认研究超时为 `360s`
+- 超时使用更长的 `proxy.research_timeout`（默认 `360s`）
+
+## 流式响应
+
+请求体里 `"stream": true`，会得到 Anthropic 标准 SSE 序列（`message_start`、`content_block_*`、`message_delta`、`message_stop`）。最后一个 delta 还会带 `usage_stats`，内含本次请求记账到对应账号的输入 / 输出 token，便于客户端做配额预测。
+
+## 错误格式
+
+完全遵循 Anthropic：
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "message": "messages is required"
+  }
+}
+```
+
+常见错误：
+
+- `401 unauthorized` —— API Key 缺失或错误
+- `400 invalid_request_error` —— JSON 错误、`messages` 为空、附件类型不支持
+- `429 rate_limit_error` —— 池内所有账号都已耗尽配额，错误消息会指明具体哪一项配额触发
+- `502 bad_gateway` —— 上游 Notion 在重试后仍报错

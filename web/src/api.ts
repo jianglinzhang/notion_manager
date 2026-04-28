@@ -1,4 +1,4 @@
-import type { DashboardData } from './types'
+import type { DashboardData, JobStartResponse, ProviderInfo, RegisterJob, TokenStats } from './types'
 
 // --- Auth API ---
 
@@ -171,9 +171,23 @@ export async function logout(): Promise<void> {
 
 // --- Dashboard API ---
 
-export async function fetchDashboardData(): Promise<DashboardData> {
-  // Uses dashboard session cookie for auth (not API key)
-  const resp = await fetch('/admin/accounts')
+export interface AccountListParams {
+  page?: number
+  pageSize?: number
+  query?: string
+}
+
+export async function fetchDashboardData(params: AccountListParams = {}): Promise<DashboardData> {
+  // Uses dashboard session cookie for auth (not API key).
+  // Server-side pagination keeps the payload small for big pools — see
+  // proxy.HandleAdminAccounts for the contract.
+  const sp = new URLSearchParams()
+  if (params.page !== undefined) sp.set('page', String(params.page))
+  if (params.pageSize !== undefined) sp.set('page_size', String(params.pageSize))
+  if (params.query && params.query.trim()) sp.set('q', params.query.trim())
+  const qs = sp.toString()
+  const url = qs ? `/admin/accounts?${qs}` : '/admin/accounts'
+  const resp = await fetch(url)
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
   return resp.json()
 }
@@ -181,6 +195,13 @@ export async function fetchDashboardData(): Promise<DashboardData> {
 export async function triggerRefresh(): Promise<{ started: boolean; message?: string }> {
   // Uses dashboard session cookie for auth (not API key)
   const resp = await fetch('/admin/refresh', { method: 'POST' })
+  return resp.json()
+}
+
+export async function fetchTokenStats(): Promise<TokenStats> {
+  // Uses dashboard session cookie for auth (not API key)
+  const resp = await fetch('/admin/stats')
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
   return resp.json()
 }
 
@@ -218,25 +239,23 @@ export async function addAccount(tokenV2: string): Promise<AddAccountResult> {
   return data
 }
 
-export async function deleteAccount(email: string): Promise<{ status?: string; error?: string }> {
-  const resp = await fetch('/admin/accounts/delete', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    credentials: 'same-origin',
-    body: JSON.stringify({ email }),
-  })
-  const data = await readJson<{ status?: string; error?: string }>(resp, '删除账号接口返回了无效响应')
-  if (!resp.ok) return { error: data.error || `HTTP ${resp.status}` }
-  return data
-}
-
 // --- Settings API ---
 
 export interface SearchSettings {
   enable_web_search: boolean
   enable_workspace_search: boolean
+  // ask_mode_default flips Notion's workflow useReadOnlyMode flag for
+  // every chat request — model answers but skips edits, matching the
+  // frontend "Ask" toggle. Per-request `-ask` model suffix still
+  // overrides this default for a single call.
+  ask_mode_default: boolean
   disable_notion_prompt: boolean
   debug_logging: boolean
+  // notion_proxy is the global upstream proxy applied to every Notion-bound
+  // outbound connection. Empty string means "direct dial". Editing this
+  // field via /admin/settings PUT immediately drops idle pooled
+  // connections so subsequent requests pick up the new upstream.
+  notion_proxy: string
 }
 
 export async function fetchSettings(): Promise<SearchSettings> {
@@ -246,13 +265,115 @@ export async function fetchSettings(): Promise<SearchSettings> {
   return resp.json()
 }
 
-export async function updateSettings(settings: Partial<Pick<SearchSettings, 'enable_web_search' | 'enable_workspace_search' | 'debug_logging'>>): Promise<SearchSettings> {
+export async function updateSettings(settings: Partial<Pick<SearchSettings, 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging' | 'notion_proxy'>>): Promise<SearchSettings> {
   // Uses dashboard session cookie for auth (not API key)
   const resp = await fetch('/admin/settings', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(settings),
   })
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  if (!resp.ok) {
+    // Surface server-side validation errors (e.g. unsupported proxy
+    // scheme) so the caller can show them in a toast and roll the input
+    // back instead of silently saving.
+    const text = await resp.text()
+    let msg = `HTTP ${resp.status}`
+    if (text) {
+      try {
+        const data = JSON.parse(text)
+        if (data && typeof data.error === 'string') msg = data.error
+      } catch { /* ignore */ }
+    }
+    throw new Error(msg)
+  }
   return resp.json()
+}
+
+// --- Bulk Register Jobs API ---
+
+async function jsonOrError(resp: Response): Promise<any> {
+  const text = await resp.text()
+  let data: any = null
+  if (text) {
+    try { data = JSON.parse(text) } catch { /* ignore */ }
+  }
+  if (!resp.ok) {
+    const msg = (data && typeof data.error === 'string') ? data.error : `HTTP ${resp.status}`
+    throw new Error(msg)
+  }
+  return data
+}
+
+export async function listProviders(): Promise<ProviderInfo[]> {
+  const resp = await fetch('/admin/register/providers', {
+    credentials: 'same-origin',
+  })
+  const data = await jsonOrError(resp)
+  return Array.isArray(data?.providers) ? data.providers : []
+}
+
+export async function startRegisterJob(
+  provider: string,
+  input: string,
+  concurrency: number,
+  proxy?: string,
+): Promise<JobStartResponse> {
+  const body: Record<string, unknown> = { provider, input, concurrency }
+  if (proxy && proxy.trim() !== '') body.proxy = proxy.trim()
+  const resp = await fetch('/admin/register/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(body),
+  })
+  return jsonOrError(resp) as Promise<JobStartResponse>
+}
+
+export async function retryRegisterJob(id: string): Promise<JobStartResponse> {
+  const resp = await fetch(`/admin/register/jobs/${encodeURIComponent(id)}/retry`, {
+    method: 'POST',
+    credentials: 'same-origin',
+  })
+  return jsonOrError(resp) as Promise<JobStartResponse>
+}
+
+export async function deleteRegisterJob(id: string): Promise<void> {
+  const resp = await fetch(`/admin/register/jobs/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+  })
+  await jsonOrError(resp)
+}
+
+export async function listJobs(limit = 50): Promise<RegisterJob[]> {
+  const resp = await fetch(`/admin/register/jobs?limit=${encodeURIComponent(String(limit))}`, {
+    credentials: 'same-origin',
+  })
+  const data = await jsonOrError(resp)
+  return Array.isArray(data) ? data : []
+}
+
+export async function getJob(id: string): Promise<RegisterJob> {
+  const resp = await fetch(`/admin/register/jobs/${encodeURIComponent(id)}`, {
+    credentials: 'same-origin',
+  })
+  return jsonOrError(resp) as Promise<RegisterJob>
+}
+
+export async function deleteAccount(email: string): Promise<void> {
+  const resp = await fetch(`/admin/accounts/${encodeURIComponent(email)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+  })
+  await jsonOrError(resp)
+}
+
+export function jobEventsUrl(id: string): string {
+  return `/admin/register/jobs/${encodeURIComponent(id)}/events`
+}
+
+export function openJobStream(id: string): EventSource {
+  // EventSource always sends cookies on same-origin requests, no extra opts
+  // are required for the dashboard session.
+  return new EventSource(jobEventsUrl(id))
 }

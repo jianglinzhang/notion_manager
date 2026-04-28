@@ -1,8 +1,12 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
-import type { DashboardData, AccountInfo, RefreshStatus } from './types'
-import { fetchDashboardData, openProxy, openBestProxy, checkAuth, login, logout, triggerRefresh, fetchSettings, updateSettings, addAccount, deleteAccount } from './api'
+import type { DashboardData, AccountInfo, AccountSummary, RefreshStatus, TokenStats } from './types'
+import { fetchDashboardData, openProxy, openBestProxy, checkAuth, login, logout, triggerRefresh, fetchSettings, updateSettings, addAccount, fetchTokenStats } from './api'
 import type { SearchSettings } from './api'
-import { fmt, getQuotaStatusByUsage, getQuotaPct, avatarColor, avatarLetter, formatCheckedAt, formatTimestampMs } from './utils'
+import { fmt, formatTokens, getQuotaStatusByUsage, getQuotaPct, avatarColor, avatarLetter, formatCheckedAt, formatTimestampMs, providerDisplay } from './utils'
+import { AccountMenu } from './components/AccountMenu'
+import { RegisterModal } from './components/RegisterModal'
+import { HistoryDrawer } from './components/HistoryDrawer'
+import { IconUserPlus, IconHistory } from './components/Icons'
 
 // --- Icons ---
 const IconBarChart = () => (
@@ -32,6 +36,11 @@ const IconFlask = () => (
     <path d="M8.5 2h7" />
     <path d="M14 9.3a6.5 6.5 0 1 1-4 0" />
     <path d="M5.52 16h12.96" />
+  </svg>
+)
+const IconActivity = () => (
+  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
   </svg>
 )
 const IconSettings = () => (
@@ -228,11 +237,25 @@ function Header({ query, onQuery, onLogout, authRequired }: {
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === '/' && document.activeElement !== inputRef.current) {
+      if (e.key === '/') {
+        // Don't hijack "/" when the user is already typing in another
+        // input/textarea/contenteditable — otherwise modals like the
+        // register form (proxy URL, credentials textarea, etc.) lose
+        // focus mid-keystroke.
+        const ae = document.activeElement as HTMLElement | null
+        const inEditable =
+          !!ae &&
+          (ae.tagName === 'INPUT' ||
+            ae.tagName === 'TEXTAREA' ||
+            ae.tagName === 'SELECT' ||
+            ae.isContentEditable)
+        if (inEditable) return
         e.preventDefault()
         inputRef.current?.focus()
       }
-      if (e.key === 'Escape') inputRef.current?.blur()
+      if (e.key === 'Escape' && document.activeElement === inputRef.current) {
+        inputRef.current?.blur()
+      }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -275,12 +298,15 @@ function Header({ query, onQuery, onLogout, authRequired }: {
   )
 }
 
-function StatCard({ label, value, sub, color }: { label: string; value: string | number; sub: string; color?: string }) {
+function StatCard({ label, value, sub, color, icon }: { label: string; value: string | number; sub: string; color?: string; icon?: React.ReactNode }) {
   return (
     <div className="px-6 py-5">
-      <div className="text-[11px] text-text-secondary uppercase tracking-wider mb-1">{label}</div>
+      <div className="text-[11px] text-text-secondary uppercase tracking-wider mb-1 flex items-center gap-1.5">
+        {icon}
+        <span>{label}</span>
+      </div>
       <div className="text-2xl font-bold tracking-tight tabular-nums" style={color ? { color } : undefined}>{value}</div>
-      <div className="text-[11px] text-text-muted mt-1">{sub}</div>
+      <div className="text-[11px] text-text-muted mt-1 truncate">{sub}</div>
     </div>
   )
 }
@@ -341,13 +367,13 @@ function OverviewBar({ label, usage, limit }: { label: string; usage: number; li
   )
 }
 
-function TotalQuotaBar({ accounts }: { accounts: AccountInfo[] }) {
-  const totalSpaceUsage = accounts.reduce((sum, account) => sum + getSpaceQuota(account).usage, 0)
-  const totalSpaceLimit = accounts.reduce((sum, account) => sum + getSpaceQuota(account).limit, 0)
-  const totalUserUsage = accounts.reduce((sum, account) => sum + getUserQuota(account).usage, 0)
-  const totalUserLimit = accounts.reduce((sum, account) => sum + getUserQuota(account).limit, 0)
-  const totalPremiumBalance = accounts.reduce((sum, account) => sum + (account.premium_balance || 0), 0)
-  const totalPremiumLimit = accounts.reduce((sum, account) => sum + (account.premium_limit || 0), 0)
+function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
+  const totalSpaceUsage = summary?.total_space_usage ?? 0
+  const totalSpaceLimit = summary?.total_space_limit ?? 0
+  const totalUserUsage = summary?.total_user_usage ?? 0
+  const totalUserLimit = summary?.total_user_limit ?? 0
+  const totalPremiumBalance = summary?.total_premium_balance ?? 0
+  const totalPremiumLimit = summary?.total_premium_limit ?? 0
   const sameBasicQuota = isSameQuota(
     { usage: totalSpaceUsage, limit: totalSpaceLimit },
     { usage: totalUserUsage, limit: totalUserLimit },
@@ -413,16 +439,15 @@ function Badge({ children, variant }: { children: React.ReactNode; variant: 'pla
   )
 }
 
-function AccountCard({ account, onDelete }: { account: AccountInfo; onDelete?: (email: string) => void }) {
+function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: () => void }) {
   const [showModels, setShowModels] = useState(false)
-  const [confirmDelete, setConfirmDelete] = useState(false)
-  const [deleting, setDeleting] = useState(false)
   const spaceQuota = getSpaceQuota(account)
   const userQuota = getUserQuota(account)
   const sameBasicQuota = isSameQuota(spaceQuota, userQuota)
   const premium = hasPremiumAccess(account)
   const researchLimited = isResearchLimited(account)
-  const status = account.permanent || account.exhausted
+  const noWorkspace = !!account.no_workspace
+  const status = account.permanent || account.exhausted || noWorkspace
     ? 'exhausted'
     : mergeQuotaStatus([
       getQuotaStatusByUsage(spaceQuota.usage, spaceQuota.limit),
@@ -431,14 +456,29 @@ function AccountCard({ account, onDelete }: { account: AccountInfo; onDelete?: (
   const modelCount = account.models?.length || 0
 
   const dotCls = status === 'exhausted' ? 'bg-err' : status === 'low' ? 'bg-err' : 'bg-ok'
+  // no_workspace shares the exhausted card style so the operator
+  // immediately sees the account is unhealthy. Click-through is blocked
+  // because Notion's /ai SPA hangs indefinitely on these accounts (the
+  // root-cause this fix is for).
   const cardBg = account.permanent ? 'bg-bg-exhausted border-white/[0.03] opacity-55'
-    : account.exhausted ? 'bg-bg-exhausted border-white/[0.03]'
+    : account.exhausted || noWorkspace ? 'bg-bg-exhausted border-white/[0.03]'
     : 'bg-bg-card hover:bg-bg-card-hover border-white/[0.03] hover:border-white/[0.07]'
+
+  const handleClick = () => {
+    if (noWorkspace) {
+      // Use a native alert — we don't have a toast infra and openProxy
+      // would otherwise pop a tab that displays raw JSON 409 to the user.
+      alert('该账号没有可访问的 Notion 工作区，无法打开 /ai 反代。请重新注册或选择其他账号。')
+      return
+    }
+    openProxy(account.email)
+  }
 
   return (
     <div
-      className={`rounded-lg p-4 border cursor-pointer transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/30 ${cardBg}`}
-      onClick={() => openProxy(account.email)}
+      className={`rounded-lg p-4 border ${noWorkspace ? 'cursor-not-allowed' : 'cursor-pointer hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/30'} transition-all duration-200 ${cardBg}`}
+      onClick={handleClick}
+      title={noWorkspace ? '账号无可访问工作区，已被排除出选号池' : undefined}
     >
       {/* Header */}
       <div className="flex items-center gap-2.5 mb-2.5">
@@ -455,12 +495,18 @@ function AccountCard({ account, onDelete }: { account: AccountInfo; onDelete?: (
           </div>
           <div className="text-[11px] text-text-secondary truncate">{account.email || '—'}</div>
         </div>
-        <div className={`w-2 h-2 rounded-full shrink-0 ${dotCls}`} />
+        <div className="flex items-center gap-1 shrink-0">
+          <div className={`w-2 h-2 rounded-full ${dotCls}`} />
+          <AccountMenu account={account} onChanged={onChanged} />
+        </div>
       </div>
 
       {/* Badges */}
       <div className="flex gap-3 flex-wrap mt-3 mb-2.5 items-center">
         <Badge variant="plan">{account.plan || 'unknown'}</Badge>
+        {account.registered_via && (
+          <Badge variant="plan">via {providerDisplay(account.registered_via)}</Badge>
+        )}
         {premium && <Badge variant="premium">AI Premium</Badge>}
         {(account.research_usage != null && account.research_usage > 0) && (
           <Badge variant={researchLimited ? 'warning' : 'research'}>
@@ -469,6 +515,7 @@ function AccountCard({ account, onDelete }: { account: AccountInfo; onDelete?: (
         )}
         {account.exhausted && !account.permanent && <Badge variant="warning">Basic blocked</Badge>}
         {account.permanent && <Badge variant="warning">Free cap</Badge>}
+        {noWorkspace && <Badge variant="warning">无工作区</Badge>}
         {modelCount > 0 && (
           <button
             onClick={e => { e.stopPropagation(); setShowModels(!showModels) }}
@@ -511,44 +558,11 @@ function AccountCard({ account, onDelete }: { account: AccountInfo; onDelete?: (
           <IconClock />
           <span className="truncate">检查 {formatCheckedAt(account.checked_at)} · 最近 AI {formatTimestampMs(account.last_usage_at)}</span>
         </span>
-        <div className="flex items-center gap-2">
-          {onDelete && (
-            confirmDelete ? (
-              <span className="flex items-center gap-1.5" onClick={e => e.stopPropagation()}>
-                <span className="text-[10px] text-err">确认删除?</span>
-                <button
-                  disabled={deleting}
-                  onClick={async (e) => {
-                    e.stopPropagation()
-                    setDeleting(true)
-                    const res = await deleteAccount(account.email)
-                    setDeleting(false)
-                    if (res.error) { alert(res.error); setConfirmDelete(false); return }
-                    onDelete(account.email)
-                  }}
-                  className="text-[10px] px-1.5 py-0.5 bg-err/20 hover:bg-err/40 text-err rounded cursor-pointer border-none transition-colors disabled:opacity-50"
-                >
-                  {deleting ? '...' : '是'}
-                </button>
-                <button
-                  onClick={(e) => { e.stopPropagation(); setConfirmDelete(false) }}
-                  className="text-[10px] px-1.5 py-0.5 bg-white/5 hover:bg-white/10 text-text-secondary rounded cursor-pointer border-none transition-colors"
-                >
-                  否
-                </button>
-              </span>
-            ) : (
-              <button
-                onClick={(e) => { e.stopPropagation(); setConfirmDelete(true) }}
-                className="text-text-muted hover:text-err transition-colors bg-transparent border-none cursor-pointer p-0.5 flex items-center"
-                title="删除账号"
-              >
-                <IconTrash />
-              </button>
-            )
-          )}
+        {noWorkspace ? (
+          <span className="text-[11px] text-err font-medium">不可用 ⚠</span>
+        ) : (
           <span className="text-[11px] text-text-secondary hover:text-white font-medium transition-colors">打开代理 →</span>
-        </div>
+        )}
       </div>
     </div>
   )
@@ -567,7 +581,10 @@ export default function App() {
   const [refreshTime, setRefreshTime] = useState('')
   const [page, setPage] = useState(0)
   const [settings, setSettings] = useState<SearchSettings | null>(null)
+  const [tokenStats, setTokenStats] = useState<TokenStats | null>(null)
   const [apiKeyRevealed, setApiKeyRevealed] = useState(false)
+  const [registerOpen, setRegisterOpen] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
   const [copiedField, setCopiedField] = useState<'key' | 'base' | null>(null)
   const [showAddModal, setShowAddModal] = useState(false)
   const copyToClipboard = (text: string, field: 'key' | 'base') => {
@@ -575,7 +592,23 @@ export default function App() {
     setCopiedField(field)
     setTimeout(() => setCopiedField(null), 1000)
   }
+  // Local draft for the global Notion proxy input. Kept separate from
+  // settings.notion_proxy so the user can type without each keystroke
+  // hitting the API; we commit on blur/Enter and roll back on error.
+  const [proxyDraft, setProxyDraft] = useState('')
+  const [proxyError, setProxyError] = useState<string | null>(null)
+  const [proxySaving, setProxySaving] = useState(false)
   const PAGE_SIZE = 20
+
+  // Debounced query: typing in the search box shouldn't fire a request
+  // on every keystroke; we wait 250ms after the user stops typing and
+  // only then re-fetch. The debounced value is what actually goes to
+  // the server.
+  const [debouncedQuery, setDebouncedQuery] = useState('')
+  useEffect(() => {
+    const handle = setTimeout(() => setDebouncedQuery(query.trim()), 250)
+    return () => clearTimeout(handle)
+  }, [query])
 
   // Check auth on mount
   useEffect(() => {
@@ -592,27 +625,42 @@ export default function App() {
     })
   }, [])
 
+  // loadData fetches the *paginated* account list using the current
+  // page + debounced query. The server filters/sorts/slices for us, so
+  // `data.accounts` is already the visible page.
   const loadData = useCallback(async () => {
     try {
-      const d = await fetchDashboardData()
+      const d = await fetchDashboardData({ page, pageSize: PAGE_SIZE, query: debouncedQuery })
       setData(d)
       setError(null)
       setRefreshTime(new Date().toLocaleTimeString('zh-CN'))
       if (d.refresh) {
         setRefreshStatus(d.refresh)
       }
-      // Load settings (non-blocking)
-      fetchSettings().then(setSettings).catch(() => {})
     } catch (e: any) {
       setError(e.message || 'Unknown error')
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [page, debouncedQuery])
 
   useEffect(() => {
     if (authState === 'authenticated') loadData()
   }, [authState, loadData])
+
+  // Settings + token stats are pool-wide and don't change with the
+  // current page/query, so we only fetch them on auth — not on every
+  // page navigation.
+  useEffect(() => {
+    if (authState !== 'authenticated') return
+    fetchSettings()
+      .then(s => {
+        setSettings(s)
+        setProxyDraft(s.notion_proxy ?? '')
+      })
+      .catch(() => {})
+    fetchTokenStats().then(setTokenStats).catch(() => {})
+  }, [authState])
 
   const handleLogout = async () => {
     await logout()
@@ -636,13 +684,40 @@ export default function App() {
     setQuotaRefreshing(false)
   }
 
-  const toggleSetting = async (key: 'enable_web_search' | 'enable_workspace_search' | 'debug_logging') => {
+  const toggleSetting = async (key: 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging') => {
     if (!settings) return
     const newVal = !settings[key]
     try {
       const updated = await updateSettings({ [key]: newVal })
       setSettings(updated)
     } catch { /* ignore */ }
+  }
+
+  // saveProxy commits the proxy input draft. We skip the round trip when
+  // the value is unchanged (typical blur after focus). Backend rejects
+  // unsupported schemes with HTTP 400 + JSON error; we surface the
+  // message inline and roll the input back to the persisted value so a
+  // typo doesn't get silently saved.
+  const saveProxy = async () => {
+    if (!settings) return
+    const next = proxyDraft.trim()
+    if (next === (settings.notion_proxy ?? '').trim()) {
+      setProxyDraft(settings.notion_proxy ?? '')
+      setProxyError(null)
+      return
+    }
+    setProxySaving(true)
+    setProxyError(null)
+    try {
+      const updated = await updateSettings({ notion_proxy: next })
+      setSettings(updated)
+      setProxyDraft(updated.notion_proxy ?? '')
+    } catch (e: any) {
+      setProxyError(e?.message || '保存失败')
+      setProxyDraft(settings.notion_proxy ?? '')
+    } finally {
+      setProxySaving(false)
+    }
   }
 
   // Auto-poll when backend is refreshing quotas
@@ -654,74 +729,51 @@ export default function App() {
     return () => clearInterval(interval)
   }, [refreshStatus?.refreshing, loadData])
 
+  // Server-paginated: data.accounts is already the visible page slice
+  // (filtered + sorted server-side). filtered_total tells us how many
+  // entries match the current query across the whole pool, which is
+  // what we need to render pagination controls.
   const accounts = data?.accounts || []
+  const paged = accounts
+  const filteredTotal = data?.filtered_total ?? data?.total ?? accounts.length
+  const totalPages = Math.max(1, Math.ceil(filteredTotal / PAGE_SIZE))
 
-  const filtered = useMemo(() => {
-    if (!query.trim()) return accounts
-    const q = query.toLowerCase()
-    return accounts.filter(a =>
-      (a.name || '').toLowerCase().includes(q) ||
-      (a.email || '').toLowerCase().includes(q) ||
-      (a.plan || '').toLowerCase().includes(q) ||
-      (a.space || '').toLowerCase().includes(q)
-    )
-  }, [accounts, query])
-
-  const sorted = useMemo(() => {
-    return [...filtered].sort((a, b) => {
-      // 1. Permanently exhausted
-      if (a.permanent !== b.permanent) return a.permanent ? 1 : -1
-      // 2. Basic quota exhausted
-      if (a.exhausted !== b.exhausted) return a.exhausted ? 1 : -1
-      // 3. More remaining basic quota
-      const aRemain = a.remaining ?? 0
-      const bRemain = b.remaining ?? 0
-      if (aRemain !== bRemain) return bRemain - aRemain
-      // 4. De-prioritize accounts with non-premium research cap reached
-      const aResearchLimited = isResearchLimited(a)
-      const bResearchLimited = isResearchLimited(b)
-      if (aResearchLimited !== bResearchLimited) return aResearchLimited ? 1 : -1
-      // 5. Stable fallback
-      return (a.name || '').localeCompare(b.name || '')
-    })
-  }, [filtered])
-
-  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE))
-  const paged = useMemo(() => sorted.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE), [sorted, page])
-
-  // Reset page when query changes
-  useEffect(() => { setPage(0) }, [query])
+  // Reset page when the (debounced) query changes so the user always
+  // lands on the first page of new search results.
+  useEffect(() => { setPage(0) }, [debouncedQuery])
+  // Clamp `page` if the result set shrank below the current page.
+  useEffect(() => {
+    if (page > 0 && page >= totalPages) setPage(Math.max(0, totalPages - 1))
+  }, [page, totalPages])
 
   const summary = useMemo(() => {
     if (!data) return null
+    const s = data.summary
+    // Note: backend's AvailableCount already excludes no_workspace, so
+    // (total - available) lumps "exhausted" and "no workspace" together.
+    // We split them out explicitly for the operator.
     const exhausted = data.total - data.available
     const availableRate = data.total > 0 ? Math.round((data.available / data.total) * 100) : 0
-    const totalResearchUsage = accounts.reduce((s, a) => s + (a.research_usage || 0), 0)
-    const totalRemaining = accounts.reduce((s, a) => s + (a.remaining || 0), 0)
-    const totalSpaceRemaining = accounts.reduce((s, a) => s + getSpaceQuota(a).remaining, 0)
-    const totalUserRemaining = accounts.reduce((s, a) => s + getUserQuota(a).remaining, 0)
-    const totalPremiumBalance = accounts.reduce((s, a) => s + (a.premium_balance || 0), 0)
-    const totalPremiumLimit = accounts.reduce((s, a) => s + (a.premium_limit || 0), 0)
-    const premiumAccounts = accounts.filter(hasPremiumAccess).length
-    const researchLimited = accounts.filter(a => !a.exhausted && !a.permanent && isResearchLimited(a)).length
     const sameBasicQuota = isSameQuota(
-      { usage: accounts.reduce((s, a) => s + getSpaceQuota(a).usage, 0), limit: accounts.reduce((s, a) => s + getSpaceQuota(a).limit, 0) },
-      { usage: accounts.reduce((s, a) => s + getUserQuota(a).usage, 0), limit: accounts.reduce((s, a) => s + getUserQuota(a).limit, 0) },
+      { usage: s?.total_space_usage ?? 0, limit: s?.total_space_limit ?? 0 },
+      { usage: s?.total_user_usage ?? 0, limit: s?.total_user_limit ?? 0 },
     )
     return {
       exhausted,
+      exhaustedOnly: s?.exhausted_only ?? 0,
+      noWorkspace: s?.no_workspace ?? 0,
       availableRate,
-      totalResearchUsage,
-      totalRemaining,
-      totalSpaceRemaining,
-      totalUserRemaining,
-      totalPremiumBalance,
-      totalPremiumLimit,
-      premiumAccounts,
-      researchLimited,
+      totalResearchUsage: s?.total_research_usage ?? 0,
+      totalRemaining: s?.total_remaining ?? 0,
+      totalSpaceRemaining: s?.total_space_remaining ?? 0,
+      totalUserRemaining: s?.total_user_remaining ?? 0,
+      totalPremiumBalance: s?.total_premium_balance ?? 0,
+      totalPremiumLimit: s?.total_premium_limit ?? 0,
+      premiumAccounts: s?.premium_accounts ?? 0,
+      researchLimited: s?.research_limited ?? 0,
       sameBasicQuota,
     }
-  }, [data, accounts])
+  }, [data])
 
   // Auth checking spinner
   if (authState === 'checking') {
@@ -761,10 +813,12 @@ export default function App() {
       <main className="max-w-[1280px] mx-auto px-6 py-6">
         {/* Summary */}
         {summary && (
-          <div className="grid grid-cols-4 divide-x divide-white/[.05] mb-6 max-md:grid-cols-2 max-md:divide-x-0 max-sm:grid-cols-1">
+          <div className="grid grid-cols-5 divide-x divide-white/[.05] mb-6 max-lg:grid-cols-3 max-md:grid-cols-2 max-md:divide-x-0 max-sm:grid-cols-1">
             <StatCard
               label="总账号" value={data!.total}
-              sub={`${data!.available} 可用 / ${summary.exhausted} 耗尽`}
+              sub={summary.noWorkspace > 0
+                ? `${data!.available} 可用 / ${summary.exhaustedOnly} 耗尽 / ${summary.noWorkspace} 无工作区`
+                : `${data!.available} 可用 / ${summary.exhausted} 耗尽`}
             />
             <StatCard
               label="可用" value={data!.available}
@@ -784,11 +838,20 @@ export default function App() {
                 : `无 premium credits · Research 受限 ${summary.researchLimited}`}
               color="var(--color-research, #9b51e0)"
             />
+            <StatCard
+              icon={<IconActivity />}
+              label="Token 用量"
+              value={formatTokens(tokenStats?.total.total ?? 0)}
+              sub={tokenStats
+                ? `今日 ${formatTokens(tokenStats.today.total)} · 输入 ${formatTokens(tokenStats.today.input)} · 输出 ${formatTokens(tokenStats.today.output)}`
+                : '尚未产生用量'}
+              color="var(--color-notion-blue)"
+            />
           </div>
         )}
 
         {/* Total Quota Bar */}
-        <TotalQuotaBar accounts={accounts} />
+        <TotalQuotaBar summary={data?.summary} />
 
         {/* Refresh Status Banner */}
         {refreshStatus?.refreshing && (
@@ -835,6 +898,18 @@ export default function App() {
             className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
           >
             <IconPlus /> 添加账号
+          </button>
+          <button
+            onClick={() => setRegisterOpen(true)}
+            className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
+          >
+            <IconUserPlus size={13} /> 注册账号
+          </button>
+          <button
+            onClick={() => setHistoryOpen(true)}
+            className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
+          >
+            <IconHistory size={13} /> 历史任务
           </button>
           {refreshTime && (
             <span className="text-[11px] text-text-muted">
@@ -893,6 +968,31 @@ export default function App() {
                       {copiedField === 'base' ? '✓ 已复制' : apiBase}
                     </code>
                   </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] text-text-muted">全局代理</span>
+                    <span
+                      className={`inline-block w-1.5 h-1.5 rounded-full ${proxyError ? 'bg-err' : settings.notion_proxy ? 'bg-ok' : 'bg-text-muted/60'}`}
+                      title={proxyError ? proxyError : settings.notion_proxy ? '已启用代理' : '直连'}
+                    />
+                    <input
+                      type="text"
+                      value={proxyDraft}
+                      onChange={e => { setProxyDraft(e.target.value); if (proxyError) setProxyError(null) }}
+                      onBlur={saveProxy}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+                        if (e.key === 'Escape') {
+                          setProxyDraft(settings.notion_proxy ?? '')
+                          setProxyError(null)
+                          ;(e.target as HTMLInputElement).blur()
+                        }
+                      }}
+                      placeholder="留空 = 直连"
+                      disabled={proxySaving}
+                      className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded font-mono outline-none border w-[160px] focus:w-[280px] transition-[width,border-color] duration-150 ${proxyError ? 'border-err text-err' : 'border-transparent focus:border-white/20 text-text-primary'} placeholder:text-text-muted/60`}
+                      title={proxyError || (settings.notion_proxy ? `当前: ${settings.notion_proxy}` : '当前: 直连')}
+                    />
+                  </div>
                 </div>
                 <div className="flex items-center gap-5 ml-auto">
                   <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -913,6 +1013,18 @@ export default function App() {
                     </button>
                     <span className="text-[12px] text-text-primary">工作区搜索</span>
                   </label>
+                  <label
+                    className="flex items-center gap-2 cursor-pointer select-none"
+                    title="开启后所有请求默认进入 ASK 模式（仅回答、不写入页面）。单次覆盖：在模型名末尾追加 -ask，例如 claude-sonnet-4.6-ask"
+                  >
+                    <button
+                      onClick={() => toggleSetting('ask_mode_default')}
+                      className={`relative w-7 h-4 rounded-full transition-colors duration-200 cursor-pointer border-none ${settings.ask_mode_default ? 'bg-[#4dab9a]' : 'bg-white/10 border border-white/5'}`}
+                    >
+                      <span className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full transition-all duration-200 ${settings.ask_mode_default ? 'bg-white shadow-sm translate-x-[12px]' : 'bg-white/40'}`} />
+                    </button>
+                    <span className="text-[12px] text-text-primary">ASK 模式</span>
+                  </label>
                   <label className="flex items-center gap-2 cursor-pointer select-none">
                     <button
                       onClick={() => toggleSetting('debug_logging')}
@@ -931,18 +1043,18 @@ export default function App() {
         {/* Section Title */}
         <div className="text-[12px] font-semibold text-text-secondary uppercase tracking-wider mb-3.5 flex items-center gap-1.5">
           <span>账号池</span>
-          <span className="font-normal text-text-muted">({sorted.length})</span>
+          <span className="font-normal text-text-muted">({filteredTotal})</span>
         </div>
 
         {/* Grid */}
-        {sorted.length === 0 ? (
+        {filteredTotal === 0 ? (
           <div className="text-center py-16 text-text-secondary text-sm">
             没有找到匹配的账号
           </div>
         ) : (
           <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-2.5 mb-4">
             {paged.map(acc => (
-              <AccountCard key={acc.email} account={acc} onDelete={() => loadData()} />
+              <AccountCard key={acc.email} account={acc} onChanged={loadData} />
             ))}
           </div>
         )}
@@ -985,6 +1097,30 @@ export default function App() {
         )}
       </main>
       {showAddModal && <AddAccountModal onClose={() => setShowAddModal(false)} onSuccess={loadData} />}
+
+      <RegisterModal
+        open={registerOpen}
+        onClose={() => setRegisterOpen(false)}
+        onJobFinished={() => {
+          // Immediate reload so newly-registered accounts show up. The
+          // backend kicks off a per-account quota refresh in a goroutine
+          // after each success; that lands a few seconds later, so we
+          // schedule a second reload to pick up the freshly-cached
+          // quota_info from disk.
+          loadData()
+          window.setTimeout(() => { loadData() }, 4000)
+        }}
+      />
+      <HistoryDrawer
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+        onRetryStarted={() => {
+          // Reload account list once the retry finishes so newly succeeded
+          // accounts surface in the dashboard. Best-effort: the drawer's
+          // own poller picks up live counters in the meantime.
+          window.setTimeout(() => { loadData() }, 4000)
+        }}
+      />
     </div>
   )
 }

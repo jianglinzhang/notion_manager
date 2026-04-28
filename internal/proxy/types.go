@@ -24,11 +24,25 @@ type Account struct {
 	DeviceID      string       `json:"device_id,omitempty"`
 	FullCookie    string       `json:"full_cookie,omitempty"`
 	Models        []ModelEntry `json:"available_models"`
+	// RegisteredVia tags which Provider.ID() created this account (e.g.
+	// "microsoft"). Empty for accounts onboarded before the provider
+	// registry existed; the dashboard treats those as legacy Microsoft.
+	RegisteredVia string `json:"registered_via,omitempty"`
 	// Runtime-only fields (not serialized)
 	QuotaExhaustedAt     *time.Time `json:"-"`
 	QuotaInfo            *QuotaInfo `json:"-"`
 	QuotaCheckedAt       *time.Time `json:"-"`
 	PermanentlyExhausted bool       `json:"-"`
+	// Workspace probe state. SpaceCount is the number of `space_views`
+	// returned by /api/v3/loadUserContent for this account's user_root.
+	// 0 with WorkspaceCheckedAt != nil means the Notion onboarding
+	// never completed (or the workspace was deleted) — the SPA renders
+	// a perpetual skeleton on /ai for such accounts. The pool refuses to
+	// route traffic to these accounts and the dashboard surfaces them as
+	// "无工作区". WorkspaceCheckedAt == nil means the account hasn't been
+	// probed yet; we treat it as unknown / usable until the next refresh.
+	SpaceCount         int        `json:"-"`
+	WorkspaceCheckedAt *time.Time `json:"-"`
 }
 
 // QuotaInfo holds AI usage quota information from V1 + V2 APIs
@@ -232,6 +246,7 @@ type CallOptions struct {
 	ThinkingBlocks        *[]ThinkingBlock
 	EnableWebSearch       bool                  // force useWebSearch=true in Notion config
 	EnableWorkspaceSearch *bool                 // override workspace search (nil = use config default)
+	UseReadOnlyMode       bool                  // ASK mode — Notion's workflow useReadOnlyMode=true (model answers but skips edits)
 	Attachments           []UploadedAttachment  // uploaded file attachments to include in transcript
 	IsResearcher          bool                  // researcher mode (deep research)
 	ThinkingCallback      ThinkingDeltaCallback // incremental thinking/process callback for streaming
