@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	mrand "math/rand"
 	"os"
@@ -21,10 +22,82 @@ import (
 // transport pinned to www.notion.so, which can't be repointed at httptest
 // URLs).
 var (
-	quotaFetcher   = CheckQuota
-	modelsFetcher  = FetchModels
-	workspaceProbe = CheckUserWorkspace
+	quotaFetcher    = CheckQuota
+	modelsFetcher   = FetchModels
+	workspaceProbe  = CheckUserWorkspace
+	accountChmod    = os.Chmod
+	accountReadFile = os.ReadFile
 )
+
+const (
+	accountsDirMode = 0o700
+	accountFileMode = 0o600
+)
+
+func ensurePrivateAccountsDir(dir string) error {
+	if err := os.MkdirAll(dir, accountsDirMode); err != nil {
+		return err
+	}
+	return accountChmod(dir, accountsDirMode)
+}
+
+func chmodAccountDir(dir string) error {
+	return accountChmod(dir, accountsDirMode)
+}
+
+func chmodAccountFile(path string) error {
+	return accountChmod(path, accountFileMode)
+}
+
+func readPrivateAccountsDir(dir string) ([]os.DirEntry, error) {
+	if err := chmodAccountDir(dir); err != nil {
+		return nil, fmt.Errorf("secure accounts dir permissions: %w", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read accounts dir: %w", err)
+	}
+	return entries, nil
+}
+
+func readPrivateAccountFile(path string) ([]byte, error) {
+	if err := chmodAccountFile(path); err != nil {
+		return nil, fmt.Errorf("secure account file %s permissions: %w", filepath.Base(path), err)
+	}
+	data, err := accountReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read account file %s: %w", filepath.Base(path), err)
+	}
+	return data, nil
+}
+
+func writePrivateAccountFile(path string, data []byte) (err error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, accountFileMode)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
+	if err := f.Chmod(accountFileMode); err != nil {
+		return err
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return err
+	}
+	if n, err := f.Write(data); err != nil {
+		return err
+	} else if n != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
 
 type AccountPool struct {
 	mu       sync.RWMutex
@@ -49,6 +122,16 @@ func NewAccountPool() *AccountPool {
 	return &AccountPool{
 		liveQuotaInflight: make(map[*Account]bool),
 	}
+}
+
+// AccountsSnapshot returns a stable copy of the pool membership for startup
+// activation. Mutating the returned slice does not change the source pool.
+func (p *AccountPool) AccountsSnapshot() []*Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	accounts := make([]*Account, len(p.accounts))
+	copy(accounts, p.accounts)
+	return accounts
 }
 
 type accountQuotaSnapshot struct {
@@ -158,20 +241,28 @@ func (acc *Account) clearQuotaExhausted() {
 }
 
 func (p *AccountPool) LoadFromDir(dir string) error {
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
-		return fmt.Errorf("read accounts dir: %w", err)
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		if err := chmodAccountFile(filepath.Join(dir, entry.Name())); err != nil {
+			return fmt.Errorf("secure account file %s permissions: %w", entry.Name(), err)
+		}
 	}
 
+	seen := make(map[string]bool)
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			log.Printf("[account] skip %s: %v", entry.Name(), err)
-			continue
+			return err
 		}
 		var acc Account
 		if err := json.Unmarshal(data, &acc); err != nil {
@@ -185,6 +276,14 @@ func (p *AccountPool) LoadFromDir(dir string) error {
 		if acc.TokenV2 == "YOUR_TOKEN_V2_HERE" || strings.HasPrefix(acc.UserID, "xxxxxxxx") {
 			log.Printf("[account] skip %s: placeholder/example config", entry.Name())
 			continue
+		}
+		acc.EnsureAccountID()
+		if acc.AccountID != "" && seen[acc.AccountID] {
+			log.Printf("[account] skip %s: duplicate account_id (same user_id+space_id)", entry.Name())
+			continue
+		}
+		if acc.AccountID != "" {
+			seen[acc.AccountID] = true
 		}
 		if acc.BrowserID == "" {
 			acc.BrowserID = generateUUIDv4()
@@ -200,7 +299,7 @@ func (p *AccountPool) LoadFromDir(dir string) error {
 		// ones.
 		loadPersistedWorkspace(data, &acc)
 		p.accounts = append(p.accounts, &acc)
-		log.Printf("[account] loaded: %s (%s) [%s]", acc.UserName, acc.UserEmail, acc.PlanType)
+		log.Printf("[account] loaded: %s (%s) [%s] aid=%s", acc.UserName, acc.UserEmail, acc.PlanType, acc.ShortSpaceID())
 	}
 
 	if len(p.accounts) == 0 {
@@ -221,12 +320,13 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 
 	known := make(map[string]bool, len(p.accounts))
 	for _, acc := range p.accounts {
-		if acc.UserID != "" {
-			known[acc.UserID] = true
+		acc.EnsureAccountID()
+		if acc.AccountID != "" {
+			known[acc.AccountID] = true
 		}
 	}
 
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
 		log.Printf("[account] reload %s: %v", dir, err)
 		return
@@ -237,8 +337,9 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
+			log.Printf("[account] reload skip %s: %v", entry.Name(), err)
 			continue
 		}
 		var acc Account
@@ -248,7 +349,8 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 		if acc.TokenV2 == "" || acc.UserID == "" || acc.SpaceID == "" {
 			continue
 		}
-		if known[acc.UserID] {
+		acc.EnsureAccountID()
+		if acc.AccountID != "" && known[acc.AccountID] {
 			continue
 		}
 		if acc.BrowserID == "" {
@@ -260,7 +362,9 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 		acc.QuotaInfo = loadPersistedQuotaInfo(data)
 		loadPersistedWorkspace(data, &acc)
 		p.accounts = append(p.accounts, &acc)
-		known[acc.UserID] = true
+		if acc.AccountID != "" {
+			known[acc.AccountID] = true
+		}
 		added++
 		log.Printf("[account] reload added: %s (%s)", acc.UserName, acc.UserEmail)
 	}
@@ -270,9 +374,9 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 }
 
 func (p *AccountPool) LoadSingle(tokenFile string) error {
-	data, err := os.ReadFile(tokenFile)
+	data, err := readPrivateAccountFile(tokenFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("secure token file: %w", err)
 	}
 
 	var acc Account
@@ -295,8 +399,9 @@ func (p *AccountPool) LoadSingle(tokenFile string) error {
 	if acc.ClientVersion == "" || acc.ClientVersion == "unknown" {
 		acc.ClientVersion = DefaultClientVersion
 	}
+	acc.EnsureAccountID()
 	p.accounts = append(p.accounts, &acc)
-	log.Printf("[account] loaded single account: %s", acc.UserName)
+	log.Printf("[account] loaded single account: %s (aid=%s)", acc.UserName, acc.ShortSpaceID())
 	return nil
 }
 
@@ -465,13 +570,13 @@ func (p *AccountPool) isQuotaExhausted(acc *Account) bool {
 	if quota.PermanentlyExhausted {
 		return true
 	}
+	if quota.ExhaustedAt != nil {
+		return true
+	}
 	if quota.Info != nil {
 		return !quota.Info.IsEligible
 	}
-	if quota.ExhaustedAt == nil {
-		return false
-	}
-	return true
+	return false
 }
 
 // hasNoWorkspace returns true only after a probe has confirmed the
@@ -510,6 +615,21 @@ func (p *AccountPool) MarkPermanentlyExhausted(acc *Account) {
 	log.Printf("[quota] marked %s (%s) as PERMANENTLY exhausted (free plan, no recovery)", acc.UserName, acc.UserEmail)
 }
 
+// MarkInferenceUnavailable keeps an automatically-disabled account in the
+// pool and on disk while preventing future inference routing. Free accounts
+// are permanent because their lifetime credits do not reset; paid accounts
+// remain eligible for a later API-confirmed recovery.
+func (p *AccountPool) MarkInferenceUnavailable(acc *Account) {
+	if acc == nil {
+		return
+	}
+	if isFreePlan(acc) {
+		p.MarkPermanentlyExhausted(acc)
+		return
+	}
+	p.MarkQuotaExhausted(acc)
+}
+
 // quotaApplyResult describes how applyQuotaInfo changed the account state.
 // Caller can use it to emit a human-friendly log line.
 type quotaApplyResult struct {
@@ -538,6 +658,9 @@ func (p *AccountPool) applyQuotaInfo(acc *Account, info *QuotaInfo) quotaApplyRe
 	res.BasicLeft = basicRemaining(info)
 	res.HasPremium = info.HasPremium
 	if info.IsEligible {
+		if acc.PermanentlyExhausted {
+			return res
+		}
 		if acc.QuotaExhaustedAt != nil {
 			res.Recovered = true
 		}
@@ -693,8 +816,9 @@ func (p *AccountPool) RemoveAccount(acc *Account) {
 	if dir == "" {
 		return
 	}
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
+		log.Printf("[account] remove %s: %v", acc.UserEmail, err)
 		return
 	}
 	for _, entry := range entries {
@@ -702,16 +826,27 @@ func (p *AccountPool) RemoveAccount(acc *Account) {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			continue
+			log.Printf("[account] remove %s: %v", acc.UserEmail, err)
+			return
 		}
 		var existing map[string]interface{}
 		if err := json.Unmarshal(data, &existing); err != nil {
 			continue
 		}
-		email, _ := existing["user_email"].(string)
-		if email == acc.UserEmail {
+		// Match by account_id first, fall back to user_id+space_id
+		exUID, _ := existing["user_id"].(string)
+		exSID, _ := existing["space_id"].(string)
+		exAID, _ := existing["account_id"].(string)
+		acc.EnsureAccountID()
+		match := false
+		if acc.AccountID != "" && exAID != "" {
+			match = exAID == acc.AccountID
+		} else {
+			match = exUID == acc.UserID && exSID == acc.SpaceID
+		}
+		if match {
 			if err := os.Remove(path); err != nil {
 				log.Printf("[account] failed to delete %s: %v", path, err)
 			} else {
@@ -722,9 +857,25 @@ func (p *AccountPool) RemoveAccount(acc *Account) {
 	}
 }
 
+// RemoveAccountByAccountID drops the in-memory pool entry whose AccountID
+// matches. Does NOT touch disk.
+func (p *AccountPool) RemoveAccountByAccountID(accountID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, a := range p.accounts {
+		a.EnsureAccountID()
+		if a.AccountID == accountID {
+			p.accounts = append(p.accounts[:i], p.accounts[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // RemoveAccountByEmail drops the in-memory pool entry whose user_email
 // matches (case-insensitive). Does NOT touch disk; callers are responsible
 // for the file lifecycle (used by the dashboard delete endpoint).
+// NOTE: With multi-workspace, this removes only the FIRST match.
 func (p *AccountPool) RemoveAccountByEmail(email string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -765,6 +916,40 @@ func (p *AccountPool) GetByEmail(email string) *Account {
 	defer p.mu.RUnlock()
 	for _, acc := range p.accounts {
 		if acc.UserEmail == email && !p.isUnusable(acc) {
+			return acc
+		}
+	}
+	return nil
+}
+
+// FindByEmail returns all accounts matching the given email.
+// Returns AmbiguousEmailError if multiple workspaces share the same email.
+func (p *AccountPool) FindByEmail(email string) (*Account, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var matches []*Account
+	for _, acc := range p.accounts {
+		if strings.EqualFold(acc.UserEmail, email) {
+			matches = append(matches, acc)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("no account found for email %s", email)
+	case 1:
+		return matches[0], nil
+	default:
+		return nil, &AmbiguousEmailError{Email: email, Count: len(matches)}
+	}
+}
+
+// FindByAccountID returns the account with the given AccountID, or nil.
+func (p *AccountPool) FindByAccountID(id string) *Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, acc := range p.accounts {
+		acc.EnsureAccountID()
+		if acc.AccountID == id {
 			return acc
 		}
 	}
@@ -1003,7 +1188,9 @@ func normalizeModelName(displayName string) string {
 	return s
 }
 
-// SaveAccounts persists current account state (models, quota) back to JSON files
+// SaveAccounts persists current account state (models, quota) back to JSON files.
+// Each account is matched to its disk file by account_id (not email).
+// If no file exists for an in-memory account, a new file is created.
 func (p *AccountPool) SaveAccounts(dir string) {
 	p.mu.RLock()
 	accs := make([]*Account, len(p.accounts))
@@ -1011,75 +1198,14 @@ func (p *AccountPool) SaveAccounts(dir string) {
 	p.mu.RUnlock()
 
 	for _, acc := range accs {
-		models := acc.modelsSnapshot()
-		quota := acc.quotaSnapshot()
-		// Find the matching file by user_email
-		entries, err := os.ReadDir(dir)
+		acc.EnsureAccountID()
+		err := saveAccountFile(dir, acc)
 		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-				continue
+			// No disk file yet — create one.
+			if _, createErr := SaveAccountToFile(acc, dir); createErr != nil {
+				log.Printf("[save-accounts] create file for %s (aid=%s): %v",
+					acc.UserEmail, acc.ShortSpaceID(), createErr)
 			}
-			path := filepath.Join(dir, entry.Name())
-			data, err := os.ReadFile(path)
-			if err != nil {
-				continue
-			}
-			var existing map[string]interface{}
-			if err := json.Unmarshal(data, &existing); err != nil {
-				continue
-			}
-			email, _ := existing["user_email"].(string)
-			if email != acc.UserEmail {
-				continue
-			}
-
-			// Update models
-			if len(models) > 0 {
-				var modelEntries []map[string]string
-				for _, m := range models {
-					modelEntries = append(modelEntries, map[string]string{"id": m.ID, "name": m.Name})
-				}
-				existing["available_models"] = modelEntries
-			}
-
-			// Update quota info
-			if quota.Info != nil {
-				existing["quota_info"] = map[string]interface{}{
-					"is_eligible":         quota.Info.IsEligible,
-					"space_usage":         quota.Info.SpaceUsage,
-					"space_limit":         quota.Info.SpaceLimit,
-					"user_usage":          quota.Info.UserUsage,
-					"user_limit":          quota.Info.UserLimit,
-					"last_usage_at":       quota.Info.LastUsageAtMs,
-					"research_mode_usage": quota.Info.ResearchModeUsage,
-					"has_premium":         quota.Info.HasPremium,
-					"premium_balance":     quota.Info.PremiumBalance,
-					"premium_usage":       quota.Info.PremiumUsage,
-					"premium_limit":       quota.Info.PremiumLimit,
-				}
-			}
-			if quota.CheckedAt != nil {
-				existing["quota_checked_at"] = quota.CheckedAt.Format(time.RFC3339)
-			}
-
-			// Workspace probe — only persist when we have a real
-			// observation (WorkspaceCheckedAt set) so a never-probed
-			// account doesn't accidentally get pinned at space_count=0.
-			if acc.WorkspaceCheckedAt != nil {
-				existing["space_count"] = acc.SpaceCount
-				existing["workspace_checked_at"] = acc.WorkspaceCheckedAt.Format(time.RFC3339)
-			}
-
-			// Write back
-			out, err := json.MarshalIndent(existing, "", "  ")
-			if err != nil {
-				continue
-			}
-			os.WriteFile(path, append(out, '\n'), 0644)
-			break
 		}
 	}
 }
@@ -1103,9 +1229,12 @@ func saveAccountFile(dir string, acc *Account) error {
 	if dir == "" {
 		return fmt.Errorf("saveAccountFile: empty dir")
 	}
-	entries, err := os.ReadDir(dir)
+	if err := ensurePrivateAccountsDir(dir); err != nil {
+		return fmt.Errorf("secure accounts dir: %w", err)
+	}
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
-		return fmt.Errorf("read dir: %w", err)
+		return err
 	}
 	var matchPath string
 	var existing map[string]interface{}
@@ -1114,16 +1243,25 @@ func saveAccountFile(dir string, acc *Account) error {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			continue
+			return err
 		}
 		var raw map[string]interface{}
 		if err := json.Unmarshal(data, &raw); err != nil {
 			continue
 		}
-		email, _ := raw["user_email"].(string)
-		if !strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(acc.UserEmail)) {
+		// Match by account_id first, fall back to user_id+space_id
+		acc.EnsureAccountID()
+		exAID, _ := raw["account_id"].(string)
+		if exAID == "" {
+			exUID, _ := raw["user_id"].(string)
+			exSID, _ := raw["space_id"].(string)
+			if exUID != "" && exSID != "" {
+				exAID = ComputeAccountID(exUID, exSID)
+			}
+		}
+		if acc.AccountID == "" || exAID != acc.AccountID {
 			continue
 		}
 		matchPath = path
@@ -1131,7 +1269,12 @@ func saveAccountFile(dir string, acc *Account) error {
 		break
 	}
 	if matchPath == "" {
-		return fmt.Errorf("no account file matches %s", acc.UserEmail)
+		return fmt.Errorf("no account file matches account_id for %s", acc.UserEmail)
+	}
+
+	// Migrate: persist account_id into legacy files
+	if acc.AccountID != "" {
+		existing["account_id"] = acc.AccountID
 	}
 
 	if len(acc.Models) > 0 {
@@ -1170,7 +1313,7 @@ func saveAccountFile(dir string, acc *Account) error {
 	}
 	out = append(out, '\n')
 	tmp := matchPath + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+	if err := writePrivateAccountFile(tmp, out); err != nil {
 		return fmt.Errorf("write tmp: %w", err)
 	}
 	if err := os.Rename(tmp, matchPath); err != nil {
@@ -1273,18 +1416,17 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 	for _, acc := range p.accounts {
 		quota := acc.quotaSnapshot()
 		models := acc.modelsSnapshot()
+		acc.EnsureAccountID()
 		entry := map[string]interface{}{
-			"email":        acc.UserEmail,
-			"name":         acc.UserName,
-			"plan":         acc.PlanType,
-			"space":        acc.SpaceName,
-			"exhausted":    p.isQuotaExhausted(acc),
-			"permanent":    quota.PermanentlyExhausted,
-			"no_workspace": p.hasNoWorkspace(acc),
-			// token_v2 is exposed only behind dashboard auth (the caller of
-			// HandleAdminAccounts already gates on session). The dashboard
-			// shows a "copy token" action and uses it for nothing else.
-			"token_v2": acc.TokenV2,
+			"account_id":     acc.AccountID,
+			"email":          acc.UserEmail,
+			"name":           acc.UserName,
+			"plan":           acc.PlanType,
+			"space":          acc.SpaceName,
+			"space_id_short": acc.ShortSpaceID(),
+			"exhausted":      p.isQuotaExhausted(acc),
+			"permanent":      quota.PermanentlyExhausted,
+			"no_workspace":   p.hasNoWorkspace(acc),
 		}
 		if acc.WorkspaceCheckedAt != nil {
 			entry["space_count"] = acc.SpaceCount

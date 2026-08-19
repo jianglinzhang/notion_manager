@@ -202,7 +202,7 @@ func (p *AccountPool) GetBestAccount() *Account {
 // CreateTargetedSession creates a proxy session for a specific account
 func (rp *ReverseProxy) CreateTargetedSession(w http.ResponseWriter, acc *Account) {
 	id := generateUUIDv4()
-	sess := &ProxySession{Account: acc, CreatedAt: time.Now()}
+	sess := newProxySession(acc)
 	rp.sessions.Store(id, sess)
 	http.SetCookie(w, &http.Cookie{
 		Name: "np_session", Value: id, Path: "/",
@@ -287,11 +287,14 @@ func HandleProxyStart(pool *AccountPool, rp *ReverseProxy, auth *DashboardAuth) 
 		}
 
 		email := r.URL.Query().Get("email")
+		accountID := r.URL.Query().Get("account_id")
 		best := r.URL.Query().Get("best")
 
 		var acc *Account
 		if best == "true" {
 			acc = pool.GetBestAccount()
+		} else if accountID != "" {
+			acc = pool.FindByAccountID(accountID)
 		} else if email != "" {
 			acc = pool.GetAccountByEmail(email)
 		}
